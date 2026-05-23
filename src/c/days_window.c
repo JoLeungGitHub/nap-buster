@@ -22,7 +22,8 @@
 #define VISIBLE_ROWS    3
 #define ROW_HEIGHT     44
 #define ROW_PADDING_X   6
-#define CHECK_WIDTH    28   // width reserved for checkmark on the right
+#define CHECK_WIDTH    28
+#define SCROLLBAR_W     3   // width reserved for checkmark on the right
 
 static const char * const DAY_NAMES[7] = {
     "Sunday", "Monday", "Tuesday", "Wednesday",
@@ -34,9 +35,10 @@ static const char * const DAY_NAMES[7] = {
 static Window    *s_win           = NULL;
 static TextLayer *s_title         = NULL;
 static TextLayer *s_hint          = NULL;
-static TextLayer *s_lbl[VISIBLE_ROWS];   // day name
-static TextLayer *s_chk[VISIBLE_ROWS];  // checkmark / empty
+static TextLayer *s_lbl[VISIBLE_ROWS];
+static TextLayer *s_chk[VISIBLE_ROWS];
 static Layer     *s_highlight     = NULL;
+static Layer     *s_scrollbar     = NULL;
 
 static uint8_t s_days;           // working copy of bitmask
 static int     s_selected_row = 0;
@@ -66,13 +68,24 @@ static void prv_refresh(void) {
         int day = s_scroll_offset + slot;
         if (day < 7) {
             text_layer_set_text(s_lbl[slot], DAY_NAMES[day]);
-            text_layer_set_text(s_chk[slot], prv_day_active(day) ? "✓" : "");
+            // Use filled/empty circle — works in all Pebble system fonts
+            // and matches the style of the built-in alarm app
+            text_layer_set_text(s_chk[slot],
+                prv_day_active(day) ? "(o)" : "( )");
+            bool selected = (day == s_selected_row);
+            GColor tc = selected ? GColorWhite : GColorLightGray;
+            GColor cc = prv_day_active(day)
+                ? (selected ? GColorWhite : GColorMalachite)
+                : GColorDarkGray;
+            text_layer_set_text_color(s_lbl[slot], tc);
+            text_layer_set_text_color(s_chk[slot], cc);
         } else {
             text_layer_set_text(s_lbl[slot], "");
             text_layer_set_text(s_chk[slot], "");
         }
     }
     layer_mark_dirty(s_highlight);
+    layer_mark_dirty(s_scrollbar);
 }
 
 static void prv_commit(void) {
@@ -109,9 +122,28 @@ static void prv_highlight_update(Layer *layer, GContext *ctx) {
     int slot = s_selected_row - s_scroll_offset;
     if (slot < 0 || slot >= VISIBLE_ROWS) return;
     int y = TITLE_HEIGHT + slot * ROW_HEIGHT;
-    graphics_context_set_fill_color(ctx, GColorCobaltBlue);
-    graphics_fill_rect(ctx, GRect(0, y, bounds.size.w, ROW_HEIGHT),
+    graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+    graphics_fill_rect(ctx, GRect(0, y, bounds.size.w - SCROLLBAR_W, ROW_HEIGHT),
                        0, GCornerNone);
+}
+
+static void prv_scrollbar_update(Layer *layer, GContext *ctx) {
+    GRect bounds = layer_get_bounds(layer);
+    int content_h = bounds.size.h - TITLE_HEIGHT - HINT_HEIGHT;
+
+    // Track
+    graphics_context_set_fill_color(ctx, GColorDarkGray);
+    graphics_fill_rect(ctx,
+        GRect(bounds.size.w - SCROLLBAR_W, TITLE_HEIGHT,
+              SCROLLBAR_W, content_h), 0, GCornerNone);
+
+    // Thumb
+    int thumb_h = (content_h * VISIBLE_ROWS) / 7;
+    int thumb_y = TITLE_HEIGHT + (content_h * s_scroll_offset) / 7;
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx,
+        GRect(bounds.size.w - SCROLLBAR_W, thumb_y,
+              SCROLLBAR_W, thumb_h), 0, GCornerNone);
 }
 
 // ─── Click Handlers ──────────────────────────────────────────────────────────
@@ -167,34 +199,36 @@ static void prv_window_load(Window *window) {
     layer_add_child(root, s_highlight);
 
     // 3 visible row slots
+    int chk_w = 36;  // wide enough for "(o)"
     for (int slot = 0; slot < VISIBLE_ROWS; slot++) {
         int y = TITLE_HEIGHT + slot * ROW_HEIGHT;
 
-        // Day name label
         s_lbl[slot] = text_layer_create(
             GRect(ROW_PADDING_X,
                   y + 10,
-                  bounds.size.w - CHECK_WIDTH - ROW_PADDING_X,
+                  bounds.size.w - chk_w - SCROLLBAR_W - ROW_PADDING_X,
                   ROW_HEIGHT - 10));
         text_layer_set_background_color(s_lbl[slot], GColorClear);
-        text_layer_set_text_color(s_lbl[slot], GColorWhite);
         text_layer_set_font(s_lbl[slot],
             fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
         layer_add_child(root, text_layer_get_layer(s_lbl[slot]));
 
-        // Checkmark (right-aligned)
         s_chk[slot] = text_layer_create(
-            GRect(bounds.size.w - CHECK_WIDTH - ROW_PADDING_X,
+            GRect(bounds.size.w - chk_w - SCROLLBAR_W - ROW_PADDING_X,
                   y + 10,
-                  CHECK_WIDTH,
+                  chk_w,
                   ROW_HEIGHT - 10));
         text_layer_set_background_color(s_chk[slot], GColorClear);
-        text_layer_set_text_color(s_chk[slot], GColorMalachite);
         text_layer_set_text_alignment(s_chk[slot], GTextAlignmentRight);
         text_layer_set_font(s_chk[slot],
-            fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+            fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
         layer_add_child(root, text_layer_get_layer(s_chk[slot]));
     }
+
+    // Scrollbar (drawn on top)
+    s_scrollbar = layer_create(bounds);
+    layer_set_update_proc(s_scrollbar, prv_scrollbar_update);
+    layer_add_child(root, s_scrollbar);
 
     // Hint bar
     s_hint = text_layer_create(
@@ -216,6 +250,7 @@ static void prv_window_unload(Window *window) {
     text_layer_destroy(s_title);
     text_layer_destroy(s_hint);
     layer_destroy(s_highlight);
+    layer_destroy(s_scrollbar);
     for (int slot = 0; slot < VISIBLE_ROWS; slot++) {
         text_layer_destroy(s_lbl[slot]);
         text_layer_destroy(s_chk[slot]);
