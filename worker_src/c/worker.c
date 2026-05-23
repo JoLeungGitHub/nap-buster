@@ -29,10 +29,12 @@
 #define PERSIST_KEY_END_HOUR           2
 #define PERSIST_KEY_SNOOZE_UNTIL       3
 #define PERSIST_KEY_ALARMING           4
+#define PERSIST_KEY_WEEKDAYS_ONLY      8
 
 #define DEFAULT_ENABLED                1
 #define DEFAULT_START_HOUR             11
 #define DEFAULT_END_HOUR               23
+#define DEFAULT_WEEKDAYS_ONLY          0
 
 #define WORKER_MSG_SLEEP_DETECTED      0
 #define APP_MSG_SNOOZE_10              10
@@ -71,6 +73,13 @@ static int prv_get_end_hour(void) {
 static bool prv_is_in_window(void) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
+
+    // Weekdays-only check (0=Sun, 6=Sat)
+    if (persist_exists(PERSIST_KEY_WEEKDAYS_ONLY) &&
+        persist_read_int(PERSIST_KEY_WEEKDAYS_ONLY)) {
+        if (t->tm_wday == 0 || t->tm_wday == 6) return false;
+    }
+
     int hour  = t->tm_hour;
     int start = prv_get_start_hour();
     int end   = prv_get_end_hour();
@@ -78,7 +87,6 @@ static bool prv_is_in_window(void) {
     if (start <= end) {
         return (hour >= start && hour < end);
     } else {
-        // Crosses midnight (e.g. 22:00–08:00)
         return (hour >= start || hour < end);
     }
 }

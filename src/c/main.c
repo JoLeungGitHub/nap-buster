@@ -56,7 +56,7 @@ static void cancel_existing_wakeup(void) {
 static void wakeup_handler(WakeupId id, int32_t cookie) {
     if (cookie == WAKEUP_REASON_SNOOZE) {
         persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
-        persist_delete(PERSIST_KEY_WAKEUP_ID);
+        persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
         start_alarm();
     }
 }
@@ -64,10 +64,18 @@ static void wakeup_handler(WakeupId id, int32_t cookie) {
 // ─── Vibration ───────────────────────────────────────────────────────────────
 
 static void fire_vibe_pattern(void) {
-    VibePattern pat = {
-        .durations    = VIBE_SEGMENTS,
-        .num_segments = VIBE_PATTERN_SEGMENTS_LEN
-    };
+    VibePattern pat;
+    switch (settings_get_vibe_strength()) {
+        case 0:   // Gentle
+            pat = (VibePattern){ .durations = VIBE_GENTLE, .num_segments = VIBE_GENTLE_LEN };
+            break;
+        case 2:   // Strong
+            pat = (VibePattern){ .durations = VIBE_STRONG, .num_segments = VIBE_STRONG_LEN };
+            break;
+        default:  // Medium (1)
+            pat = (VibePattern){ .durations = VIBE_MEDIUM, .num_segments = VIBE_MEDIUM_LEN };
+            break;
+    }
     vibes_enqueue_custom_pattern(pat);
 }
 
@@ -179,7 +187,6 @@ static void update_status_display(void) {
 static void worker_message_handler(uint16_t type, AppWorkerMessage *msg) {
     switch (type) {
         case WORKER_MSG_SLEEP_DETECTED:
-        case WORKER_MSG_SNOOZE_EXPIRED:
             start_alarm();
             break;
         default:
