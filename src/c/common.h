@@ -16,14 +16,14 @@
 #define PERSIST_KEY_ALARMING         4  // bool: foreground alarm is active
 #define PERSIST_KEY_WAKEUP_ID_SNOOZE 5  // WakeupId: scheduled snooze wakeup
 #define PERSIST_KEY_VIBE_STRENGTH    7  // int:  0=Gentle 1=Medium 2=Strong
-#define PERSIST_KEY_WEEKDAYS_ONLY    8  // bool: skip Sat+Sun
+#define PERSIST_KEY_ACTIVE_DAYS      8  // uint8 bitmask: bit0=Sun..bit6=Sat
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
 #define DEFAULT_START_HOUR           11  // 11:00 AM
 #define DEFAULT_END_HOUR             23  // 11:00 PM
 #define DEFAULT_VIBE_STRENGTH        1   // Medium
-#define DEFAULT_WEEKDAYS_ONLY        0   // guard every day
+#define DEFAULT_ACTIVE_DAYS          0x7F  // every day (bits 0-6 set)
 
 // ─── Worker / App Message Keys ────────────────────────────────────────────────
 #define WORKER_MSG_SLEEP_DETECTED    0
@@ -90,23 +90,22 @@ static inline int settings_get_vibe_strength(void) {
     return persist_read_int(PERSIST_KEY_VIBE_STRENGTH);
 }
 
-static inline bool settings_get_weekdays_only(void) {
-    if (!persist_exists(PERSIST_KEY_WEEKDAYS_ONLY)) return DEFAULT_WEEKDAYS_ONLY;
-    return (bool)persist_read_int(PERSIST_KEY_WEEKDAYS_ONLY);
+static inline uint8_t settings_get_active_days(void) {
+    if (!persist_exists(PERSIST_KEY_ACTIVE_DAYS)) return DEFAULT_ACTIVE_DAYS;
+    return (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS);
 }
 
 // ─── Window / Time Helpers ────────────────────────────────────────────────────
 
-/** True if the current time falls within the configured no-nap window,
- *  respecting the weekdays-only setting. */
+/** True if the current time falls within the configured no-nap window
+ *  AND today is an active day per the bitmask. */
 static inline bool is_in_no_nap_window(void) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
 
-    // Weekdays-only check (tm_wday: 0=Sun, 6=Sat)
-    if (settings_get_weekdays_only()) {
-        if (t->tm_wday == 0 || t->tm_wday == 6) return false;
-    }
+    // Check active-days bitmask (bit 0=Sun ... bit 6=Sat)
+    uint8_t active_days = settings_get_active_days();
+    if (!((active_days >> t->tm_wday) & 1)) return false;
 
     int hour  = t->tm_hour;
     int start = settings_get_start_hour();

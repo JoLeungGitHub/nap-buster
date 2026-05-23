@@ -20,12 +20,13 @@
 
 #include "settings.h"
 #include "common.h"
+#include "days_window.h"
 
 // ─── Row definitions ──────────────────────────────────────────────────────────
 
 typedef enum {
     ROW_ENABLED = 0,
-    ROW_WEEKDAYS_ONLY,
+    ROW_ACTIVE_DAYS,
     ROW_START_HOUR,
     ROW_END_HOUR,
     ROW_VIBE_STRENGTH,
@@ -34,7 +35,7 @@ typedef enum {
 
 static const char * const ROW_LABELS[ROW_COUNT] = {
     "Guard",
-    "Weekdays only",
+    "Active days",
     "No-nap from",
     "No-nap until",
     "Wake vibration"
@@ -60,7 +61,6 @@ static Layer     *s_highlight  = NULL;
 
 // Local copies of all settings (committed on BACK)
 static bool s_enabled;
-static bool s_weekdays_only;
 static int  s_start_hour;
 static int  s_end_hour;
 static int  s_vibe_strength;
@@ -86,8 +86,9 @@ static void prv_format_value(int row, char *buf, size_t len) {
         case ROW_ENABLED:
             snprintf(buf, len, "%s", s_enabled ? "ON" : "OFF");
             break;
-        case ROW_WEEKDAYS_ONLY:
-            snprintf(buf, len, "%s", s_weekdays_only ? "ON" : "OFF");
+        case ROW_ACTIVE_DAYS:
+            // Read live from persist so it reflects sub-window changes
+            days_summary(buf, len);
             break;
         case ROW_START_HOUR:
             snprintf(buf, len, "%02d:00", s_start_hour);
@@ -129,10 +130,10 @@ static void prv_refresh(void) {
 /** Commit all settings to flash and notify worker. */
 static void prv_commit(void) {
     persist_write_int(PERSIST_KEY_ENABLED,       (int)s_enabled);
-    persist_write_int(PERSIST_KEY_WEEKDAYS_ONLY, (int)s_weekdays_only);
     persist_write_int(PERSIST_KEY_START_HOUR,    s_start_hour);
     persist_write_int(PERSIST_KEY_END_HOUR,      s_end_hour);
     persist_write_int(PERSIST_KEY_VIBE_STRENGTH, s_vibe_strength);
+    // PERSIST_KEY_ACTIVE_DAYS is written directly by days_window.c
 
     AppWorkerMessage msg = { .data0 = APP_MSG_SETTINGS_CHANGED };
     app_worker_send_message(APP_MSG_SETTINGS_CHANGED, &msg);
@@ -171,8 +172,8 @@ static void prv_adjust_value(int row, int delta) {
         case ROW_ENABLED:
             s_enabled = !s_enabled;
             break;
-        case ROW_WEEKDAYS_ONLY:
-            s_weekdays_only = !s_weekdays_only;
+        case ROW_ACTIVE_DAYS:
+            // Handled via sub-screen — no inline adjustment
             break;
         case ROW_START_HOUR:
             s_start_hour = wrap_int(s_start_hour + delta, 23);
@@ -211,6 +212,13 @@ static void prv_down_click(ClickRecognizerRef r, void *ctx) {
 }
 
 static void prv_select_click(ClickRecognizerRef r, void *ctx) {
+    if (s_selected_row == ROW_ACTIVE_DAYS) {
+        // Commit current settings first so the day-picker can read them,
+        // then push the day-picker sub-screen (BACK from it returns here)
+        prv_commit();
+        days_window_push();
+        return;
+    }
     s_editing = !s_editing;
     prv_refresh();
 }
@@ -223,9 +231,13 @@ static void prv_click_config(void *ctx) {
 
 // ─── Window Lifecycle ────────────────────────────────────────────────────────
 
+static void prv_window_appear(Window *window) {
+    // Refresh in case we're returning from the day-picker sub-screen
+    prv_refresh();
+}
+
 static void prv_window_load(Window *window) {
     s_enabled       = settings_get_enabled();
-    s_weekdays_only = settings_get_weekdays_only();
     s_start_hour    = settings_get_start_hour();
     s_end_hour      = settings_get_end_hour();
     s_vibe_strength = settings_get_vibe_strength();
@@ -318,6 +330,7 @@ void settings_window_push(void) {
 
     WindowHandlers h = {
         .load   = prv_window_load,
+        .appear = prv_window_appear,
         .unload = prv_window_unload
     };
     window_set_window_handlers(s_win, h);

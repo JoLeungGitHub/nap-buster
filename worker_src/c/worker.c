@@ -29,12 +29,13 @@
 #define PERSIST_KEY_END_HOUR           2
 #define PERSIST_KEY_SNOOZE_UNTIL       3
 #define PERSIST_KEY_ALARMING           4
-#define PERSIST_KEY_WEEKDAYS_ONLY      8
+#define PERSIST_KEY_WEEKDAYS_ONLY      8  // DEPRECATED — replaced by ACTIVE_DAYS
+#define PERSIST_KEY_ACTIVE_DAYS        8  // uint8 bitmask bit0=Sun..bit6=Sat
 
 #define DEFAULT_ENABLED                1
 #define DEFAULT_START_HOUR             11
 #define DEFAULT_END_HOUR               23
-#define DEFAULT_WEEKDAYS_ONLY          0
+#define DEFAULT_ACTIVE_DAYS            0x7F  // every day
 
 #define WORKER_MSG_SLEEP_DETECTED      0
 #define APP_MSG_SNOOZE_10              10
@@ -74,11 +75,11 @@ static bool prv_is_in_window(void) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
 
-    // Weekdays-only check (0=Sun, 6=Sat)
-    if (persist_exists(PERSIST_KEY_WEEKDAYS_ONLY) &&
-        persist_read_int(PERSIST_KEY_WEEKDAYS_ONLY)) {
-        if (t->tm_wday == 0 || t->tm_wday == 6) return false;
-    }
+    // Active-days bitmask check (bit 0=Sun ... bit 6=Sat)
+    uint8_t active_days = persist_exists(PERSIST_KEY_ACTIVE_DAYS)
+        ? (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS)
+        : DEFAULT_ACTIVE_DAYS;
+    if (!((active_days >> t->tm_wday) & 1)) return false;
 
     int hour  = t->tm_hour;
     int start = prv_get_start_hour();
