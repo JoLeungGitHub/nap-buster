@@ -1,54 +1,72 @@
 /**
  * main.c — NapBuster Foreground Application
  *
- * Responsibilities:
- *  - Display "Wake Up!" alarm screen when launched by the worker or wakeup
- *  - Drive repeating vibration while alarming
- *  - SELECT = dismiss, UP = snooze 10 min, DOWN = snooze 30 min
- *  - Long-press SELECT (idle) → opens Settings screen
- *  - Schedule wakeup via Wakeup API for snooze re-arm
+ * Home screen shows live status based on current settings and time:
  *
- * Launch contexts:
- *  1. Normal user launch      → show status screen, start worker
- *  2. Wakeup launch           → immediately show alarm (snooze expired)
- *  3. Worker-launched         → immediately show alarm (sleep detected)
+ *   GUARDING   Green bg  — inside window, on an active day, enabled
+ *   OFF-HOURS  Dark bg   — enabled but outside window or not an active day
+ *   SNOOZED    Amber bg  — snooze is active, shows minutes remaining
+ *   DISABLED   Dark bg   — master toggle is OFF
+ *
+ * The display refreshes every minute via TickTimerService and on
+ * window_appear (so settings changes show immediately on return).
+ *
+ * Alarm screen (red bg) takes over when sleep is detected.
+ *
+ * Button map:
+ *   Idle:  long-press SELECT → settings
+ *   Alarm: SELECT=dismiss  UP=snooze 10min  DOWN=snooze 30min
  */
 
 #include <pebble.h>
 #include "common.h"
 #include "settings.h"
+#include "days_window.h"
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-// How often to re-fire the vibe pattern while alarming (ms)
 #define VIBE_REPEAT_INTERVAL_MS  3000
 
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── UI state ────────────────────────────────────────────────────────────────
 
-static Window    *s_main_window  = NULL;
-static TextLayer *s_wake_label   = NULL;   // "Wake Up!" / "NapBuster"
-static TextLayer *s_icon_label   = NULL;   // ASCII face / emoji
-static TextLayer *s_status_label = NULL;   // window status / snooze info
-static TextLayer *s_hint_label   = NULL;   // button hints
+typedef enum {
+    HOME_STATE_GUARDING,
+    HOME_STATE_OFF_HOURS,
+    HOME_STATE_SNOOZED,
+    HOME_STATE_DISABLED,
+} HomeState;
 
-static AppTimer  *s_vibe_timer   = NULL;
-static bool       s_is_alarming  = false;
+// ─── Layers ──────────────────────────────────────────────────────────────────
 
-// ─── Forward Declarations ────────────────────────────────────────────────────
+static Window    *s_win          = NULL;
+static Layer     *s_state_bar    = NULL;  // coloured top strip
+static TextLayer *s_state_label  = NULL;  // "GUARDING" / "OFF-HOURS" etc.
+static TextLayer *s_time_label   = NULL;  // current time HH:MM
+static TextLayer *s_detail_label = NULL;  // schedule / snooze info
+static TextLayer *s_days_label   = NULL;  // days summary
+static TextLayer *s_hint_label   = NULL;  // bottom hint
+
+// ─── Runtime state ───────────────────────────────────────────────────────────
+
+static AppTimer *s_vibe_timer  = NULL;
+static bool      s_is_alarming = false;
+
+// Colour used by the state bar — set in update_home_screen()
+static GColor s_bar_color;
+
+// ─── Forward declarations ────────────────────────────────────────────────────
 
 static void start_alarm(void);
 static void stop_alarm(void);
 static void schedule_snooze(int minutes);
-static void update_status_display(void);
+static void update_home_screen(void);
 
 // ─── Wakeup ──────────────────────────────────────────────────────────────────
 
 static void cancel_existing_wakeup(void) {
     if (persist_exists(PERSIST_KEY_WAKEUP_ID_SNOOZE)) {
         WakeupId wid = (WakeupId)persist_read_int(PERSIST_KEY_WAKEUP_ID_SNOOZE);
-        if (wakeup_query(wid, NULL)) {
-            wakeup_cancel(wid);
-        }
+        if (wakeup_query(wid, NULL)) wakeup_cancel(wid);
         persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
     }
 }
@@ -66,15 +84,9 @@ static void wakeup_handler(WakeupId id, int32_t cookie) {
 static void fire_vibe_pattern(void) {
     VibePattern pat;
     switch (settings_get_vibe_strength()) {
-        case 0:   // Gentle
-            pat = (VibePattern){ .durations = VIBE_GENTLE, .num_segments = VIBE_GENTLE_LEN };
-            break;
-        case 2:   // Strong
-            pat = (VibePattern){ .durations = VIBE_STRONG, .num_segments = VIBE_STRONG_LEN };
-            break;
-        default:  // Medium (1)
-            pat = (VibePattern){ .durations = VIBE_MEDIUM, .num_segments = VIBE_MEDIUM_LEN };
-            break;
+        case 0:  pat = (VibePattern){ VIBE_GENTLE, VIBE_GENTLE_LEN }; break;
+        case 2:  pat = (VibePattern){ VIBE_STRONG, VIBE_STRONG_LEN }; break;
+        default: pat = (VibePattern){ VIBE_MEDIUM, VIBE_MEDIUM_LEN }; break;
     }
     vibes_enqueue_custom_pattern(pat);
 }
@@ -95,12 +107,17 @@ static void start_alarm(void) {
     s_is_alarming = true;
     persist_write_int(PERSIST_KEY_ALARMING, 1);
 
-    text_layer_set_text(s_wake_label,  "Wake Up!");
-    text_layer_set_text(s_icon_label,  "(>_<)");
-    text_layer_set_text(s_hint_label,  "SEL: dismiss\nUP: +10min\nDN: +30min");
-    text_layer_set_text(s_status_label, "");
+    window_set_background_color(s_win, GColorRed);
 
-    window_set_background_color(s_main_window, GColorRed);
+    text_layer_set_text(s_state_label,  "WAKE UP!");
+    text_layer_set_text(s_time_label,   "(>_<)");
+    text_layer_set_text(s_detail_label, "You dozed off!");
+    text_layer_set_text(s_days_label,   "");
+    text_layer_set_text(s_hint_label,
+        "SEL: dismiss\nUP: +10 min\nDN: +30 min");
+
+    s_bar_color = GColorRed;
+    layer_mark_dirty(s_state_bar);
 
     fire_vibe_pattern();
     s_vibe_timer = app_timer_register(VIBE_REPEAT_INTERVAL_MS,
@@ -109,19 +126,15 @@ static void start_alarm(void) {
 
 static void stop_alarm(void) {
     s_is_alarming = false;
-
     if (s_vibe_timer) {
         app_timer_cancel(s_vibe_timer);
         s_vibe_timer = NULL;
     }
     vibes_cancel();
-
-    persist_write_int(PERSIST_KEY_ALARMING,     0);
+    persist_write_int(PERSIST_KEY_ALARMING, 0);
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
     cancel_existing_wakeup();
-
-    window_set_background_color(s_main_window, GColorBlack);
-    update_status_display();
+    update_home_screen();
 }
 
 static void schedule_snooze(int minutes) {
@@ -136,156 +149,303 @@ static void schedule_snooze(int minutes) {
 
     time_t snooze_until = time(NULL) + (minutes * 60);
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, (int)snooze_until);
+    persist_write_int(PERSIST_KEY_ALARMING, 0);
 
     WakeupId wid = wakeup_schedule(snooze_until, WAKEUP_REASON_SNOOZE, true);
-    if (wid >= 0) {
-        persist_write_int(PERSIST_KEY_WAKEUP_ID_SNOOZE, (int)wid);
-    }
+    if (wid >= 0) persist_write_int(PERSIST_KEY_WAKEUP_ID_SNOOZE, (int)wid);
 
-    window_set_background_color(s_main_window, GColorBlack);
-
-    static char snooze_buf[32];
-    snprintf(snooze_buf, sizeof(snooze_buf), "Snoozed\n%d min", minutes);
-    text_layer_set_text(s_wake_label,   snooze_buf);
-    text_layer_set_text(s_icon_label,   "~ z Z");
-    text_layer_set_text(s_hint_label,   "");
-    text_layer_set_text(s_status_label, "");
-
-    // Notify worker
-    AppWorkerMessage msg = { .data0 = (minutes == 10) ? APP_MSG_SNOOZE_10 : APP_MSG_SNOOZE_30 };
+    AppWorkerMessage msg = {
+        .data0 = (minutes == 10) ? APP_MSG_SNOOZE_10 : APP_MSG_SNOOZE_30
+    };
     app_worker_send_message(msg.data0, &msg);
+
+    update_home_screen();
 }
 
-// ─── Status Display ──────────────────────────────────────────────────────────
+// ─── Home Screen Update ───────────────────────────────────────────────────────
 
-static void update_status_display(void) {
+static void prv_state_bar_update(Layer *layer, GContext *ctx) {
+    GRect bounds = layer_get_bounds(layer);
+    graphics_context_set_fill_color(ctx, s_bar_color);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+}
+
+/** Determine current state and refresh all home screen layers. */
+static void update_home_screen(void) {
     if (s_is_alarming) return;
 
-    bool enabled    = settings_get_enabled();
-    int  start_hour = settings_get_start_hour();
-    int  end_hour   = settings_get_end_hour();
-    bool in_window  = is_in_no_nap_window();
+    // ── Read current settings ──
+    bool enabled     = settings_get_enabled();
+    int  start_hour  = settings_get_start_hour();
+    int  end_hour    = settings_get_end_hour();
+    bool in_window   = is_in_no_nap_window();  // checks days + hours + enabled
 
-    text_layer_set_text(s_wake_label, "NapBuster");
-
-    static char status_buf[64];
-    if (!enabled) {
-        snprintf(status_buf, sizeof(status_buf), "DISABLED\n\nHold SEL\nfor settings");
-    } else {
-        snprintf(status_buf, sizeof(status_buf),
-            "%s\n%02d:00 – %02d:00\n\nHold SEL = settings",
-            in_window ? "GUARDING" : "outside window",
-            start_hour, end_hour);
+    // ── Check snooze ──
+    bool snoozed = false;
+    int  snooze_mins_left = 0;
+    if (persist_exists(PERSIST_KEY_SNOOZE_UNTIL)) {
+        time_t snooze_until = (time_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL);
+        time_t now = time(NULL);
+        if (snooze_until > now) {
+            snoozed = true;
+            snooze_mins_left = (int)((snooze_until - now) / 60) + 1;
+        }
     }
-    text_layer_set_text(s_status_label, status_buf);
-    text_layer_set_text(s_icon_label,   enabled ? "(^_^)" : "(-_-)");
-    text_layer_set_text(s_hint_label,   "");
+
+    // ── Determine state ──
+    HomeState state;
+    if (!enabled) {
+        state = HOME_STATE_DISABLED;
+    } else if (snoozed) {
+        state = HOME_STATE_SNOOZED;
+    } else if (in_window) {
+        state = HOME_STATE_GUARDING;
+    } else {
+        state = HOME_STATE_OFF_HOURS;
+    }
+
+    // ── Current time string ──
+    static char time_buf[8];
+    clock_copy_time_string(time_buf, sizeof(time_buf));
+    text_layer_set_text(s_time_label, time_buf);
+
+    // ── Days summary ──
+    static char days_buf[12];
+    days_summary(days_buf, sizeof(days_buf));
+
+    // ── Schedule line e.g. "11:00 – 23:00" ──
+    static char sched_buf[16];
+    snprintf(sched_buf, sizeof(sched_buf), "%02d:00 – %02d:00",
+             start_hour, end_hour);
+
+    // ── Per-state content ──
+    static char detail_buf[48];
+
+    switch (state) {
+        case HOME_STATE_GUARDING:
+            s_bar_color = GColorIslamicGreen;
+            window_set_background_color(s_win, GColorBlack);
+            text_layer_set_text_color(s_state_label, GColorIslamicGreen);
+            text_layer_set_text(s_state_label,  "GUARDING");
+            snprintf(detail_buf, sizeof(detail_buf), "%s", sched_buf);
+            text_layer_set_text(s_detail_label, detail_buf);
+            text_layer_set_text(s_days_label,   days_buf);
+            text_layer_set_text(s_hint_label,   "Hold SEL: settings");
+            break;
+
+        case HOME_STATE_OFF_HOURS: {
+            // Work out when the next active period begins
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            static char next_buf[32];
+
+            // Find next day that is active
+            uint8_t active_days = settings_get_active_days();
+            int days_ahead = 0;
+            for (int i = 1; i <= 7; i++) {
+                int candidate_wday = (t->tm_wday + i) % 7;
+                if ((active_days >> candidate_wday) & 1) {
+                    days_ahead = i;
+                    break;
+                }
+            }
+            bool today_active = (active_days >> t->tm_wday) & 1;
+
+            if (today_active && t->tm_hour < start_hour) {
+                // Guard starts later today
+                snprintf(next_buf, sizeof(next_buf),
+                         "Starts at %02d:00", start_hour);
+            } else if (days_ahead == 1) {
+                snprintf(next_buf, sizeof(next_buf),
+                         "Next: tomorrow %02d:00", start_hour);
+            } else if (days_ahead > 1) {
+                // Name the next active day
+                const char *day_names[] = {
+                    "Sun","Mon","Tue","Wed","Thu","Fri","Sat" };
+                int next_wday = (t->tm_wday + days_ahead) % 7;
+                snprintf(next_buf, sizeof(next_buf),
+                         "Next: %s %02d:00", day_names[next_wday], start_hour);
+            } else {
+                snprintf(next_buf, sizeof(next_buf), "%s", sched_buf);
+            }
+
+            s_bar_color = GColorDarkGray;
+            window_set_background_color(s_win, GColorBlack);
+            text_layer_set_text_color(s_state_label, GColorLightGray);
+            text_layer_set_text(s_state_label,  "OFF-HOURS");
+            text_layer_set_text(s_detail_label, next_buf);
+            text_layer_set_text(s_days_label,   days_buf);
+            text_layer_set_text(s_hint_label,   "Hold SEL: settings");
+            break;
+        }
+
+        case HOME_STATE_SNOOZED:
+            s_bar_color = GColorChromeYellow;
+            window_set_background_color(s_win, GColorBlack);
+            text_layer_set_text_color(s_state_label, GColorChromeYellow);
+            text_layer_set_text(s_state_label, "SNOOZED");
+            snprintf(detail_buf, sizeof(detail_buf),
+                     "Resuming in\n%d min", snooze_mins_left);
+            text_layer_set_text(s_detail_label, detail_buf);
+            text_layer_set_text(s_days_label,   "");
+            text_layer_set_text(s_hint_label,   "Hold SEL: settings");
+            break;
+
+        case HOME_STATE_DISABLED:
+            s_bar_color = GColorDarkGray;
+            window_set_background_color(s_win, GColorBlack);
+            text_layer_set_text_color(s_state_label, GColorDarkGray);
+            text_layer_set_text(s_state_label,  "DISABLED");
+            snprintf(detail_buf, sizeof(detail_buf), "%s\n%s",
+                     sched_buf, days_buf);
+            text_layer_set_text(s_detail_label, detail_buf);
+            text_layer_set_text(s_days_label,   "");
+            text_layer_set_text(s_hint_label,   "Hold SEL: settings");
+            break;
+    }
+
+    layer_mark_dirty(s_state_bar);
 }
 
-// ─── Worker Message Handler ───────────────────────────────────────────────────
+// ─── Tick handler (refreshes home every minute) ───────────────────────────────
+
+static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
+    update_home_screen();
+}
+
+// ─── Worker message handler ───────────────────────────────────────────────────
 
 static void worker_message_handler(uint16_t type, AppWorkerMessage *msg) {
-    switch (type) {
-        case WORKER_MSG_SLEEP_DETECTED:
-            start_alarm();
-            break;
-        default:
-            break;
-    }
+    if (type == WORKER_MSG_SLEEP_DETECTED) start_alarm();
 }
 
-// ─── Click Handlers ──────────────────────────────────────────────────────────
+// ─── Click handlers ──────────────────────────────────────────────────────────
 
-static void select_click_handler(ClickRecognizerRef recognizer, void *ctx) {
-    if (s_is_alarming) {
-        stop_alarm();
-    }
+static void select_click(ClickRecognizerRef r, void *ctx) {
+    if (s_is_alarming) stop_alarm();
 }
 
-static void select_long_click_handler(ClickRecognizerRef recognizer, void *ctx) {
+static void select_long_click(ClickRecognizerRef r, void *ctx) {
     if (s_is_alarming) stop_alarm();
     settings_window_push();
 }
 
-static void up_click_handler(ClickRecognizerRef recognizer, void *ctx) {
+static void up_click(ClickRecognizerRef r, void *ctx) {
     if (s_is_alarming) schedule_snooze(10);
 }
 
-static void down_click_handler(ClickRecognizerRef recognizer, void *ctx) {
+static void down_click(ClickRecognizerRef r, void *ctx) {
     if (s_is_alarming) schedule_snooze(30);
 }
 
 static void click_config_provider(void *ctx) {
-    window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
-    window_single_click_subscribe(BUTTON_ID_UP,     up_click_handler);
-    window_single_click_subscribe(BUTTON_ID_DOWN,   down_click_handler);
-    window_long_click_subscribe(BUTTON_ID_SELECT, 700,
-                                select_long_click_handler, NULL);
+    window_single_click_subscribe(BUTTON_ID_SELECT, select_click);
+    window_single_click_subscribe(BUTTON_ID_UP,     up_click);
+    window_single_click_subscribe(BUTTON_ID_DOWN,   down_click);
+    window_long_click_subscribe(BUTTON_ID_SELECT, 700, select_long_click, NULL);
 }
 
-// ─── Window Lifecycle ────────────────────────────────────────────────────────
+// ─── Window lifecycle ────────────────────────────────────────────────────────
+
+static void main_window_appear(Window *window) {
+    // Refresh whenever window comes to front — catches settings changes
+    update_home_screen();
+}
 
 static void main_window_load(Window *window) {
-    Layer *root = window_get_root_layer(window);
-    GRect bounds = layer_get_bounds(root);
+    Layer *root   = window_get_root_layer(window);
+    GRect  bounds = layer_get_bounds(root);
+    int    w      = bounds.size.w;
+    int    h      = bounds.size.h;
 
-    // Title / wake label
-    s_wake_label = text_layer_create(GRect(0, 20, bounds.size.w, 50));
-    text_layer_set_background_color(s_wake_label, GColorClear);
-    text_layer_set_text_color(s_wake_label, GColorWhite);
-    text_layer_set_text_alignment(s_wake_label, GTextAlignmentCenter);
-    text_layer_set_font(s_wake_label, fonts_get_system_font(FONT_KEY_BITHAM_30_BLACK));
-    layer_add_child(root, text_layer_get_layer(s_wake_label));
+    s_bar_color = GColorDarkGray;
 
-    // ASCII face / icon
-    s_icon_label = text_layer_create(GRect(0, 78, bounds.size.w, 36));
-    text_layer_set_background_color(s_icon_label, GColorClear);
-    text_layer_set_text_color(s_icon_label, GColorYellow);
-    text_layer_set_text_alignment(s_icon_label, GTextAlignmentCenter);
-    text_layer_set_font(s_icon_label, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-    layer_add_child(root, text_layer_get_layer(s_icon_label));
+    // ── Coloured state bar (top strip, 6px tall) ──
+    s_state_bar = layer_create(GRect(0, 0, w, 6));
+    layer_set_update_proc(s_state_bar, prv_state_bar_update);
+    layer_add_child(root, s_state_bar);
 
-    // Status / snooze info
-    s_status_label = text_layer_create(GRect(4, 118, bounds.size.w - 8, 76));
-    text_layer_set_background_color(s_status_label, GColorClear);
-    text_layer_set_text_color(s_status_label, GColorLightGray);
-    text_layer_set_text_alignment(s_status_label, GTextAlignmentCenter);
-    text_layer_set_font(s_status_label, fonts_get_system_font(FONT_KEY_GOTHIC_14));
-    layer_add_child(root, text_layer_get_layer(s_status_label));
+    // ── State label e.g. "GUARDING" ──
+    s_state_label = text_layer_create(GRect(0, 8, w, 28));
+    text_layer_set_background_color(s_state_label, GColorClear);
+    text_layer_set_text_alignment(s_state_label, GTextAlignmentCenter);
+    text_layer_set_font(s_state_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+    layer_add_child(root, text_layer_get_layer(s_state_label));
 
-    // Button hints (bottom)
-    s_hint_label = text_layer_create(GRect(4, bounds.size.h - 52, bounds.size.w - 8, 50));
-    text_layer_set_background_color(s_hint_label, GColorClear);
-    text_layer_set_text_color(s_hint_label, GColorWhite);
+    // ── Divider line ──
+    // (drawn as a 1px-tall layer with a dark background)
+    Layer *divider = layer_create(GRect(8, 38, w - 16, 1));
+    // We can't draw on it without update_proc, so just leave it as black gap
+
+    // ── Current time (big) ──
+    s_time_label = text_layer_create(GRect(0, 42, w, 52));
+    text_layer_set_background_color(s_time_label, GColorClear);
+    text_layer_set_text_color(s_time_label, GColorWhite);
+    text_layer_set_text_alignment(s_time_label, GTextAlignmentCenter);
+    text_layer_set_font(s_time_label,
+        fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
+    layer_add_child(root, text_layer_get_layer(s_time_label));
+
+    // ── Detail line (schedule / snooze countdown / next active time) ──
+    s_detail_label = text_layer_create(GRect(4, 98, w - 8, 46));
+    text_layer_set_background_color(s_detail_label, GColorClear);
+    text_layer_set_text_color(s_detail_label, GColorLightGray);
+    text_layer_set_text_alignment(s_detail_label, GTextAlignmentCenter);
+    text_layer_set_font(s_detail_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_18));
+    layer_add_child(root, text_layer_get_layer(s_detail_label));
+
+    // ── Days summary (smaller, below detail) ──
+    s_days_label = text_layer_create(GRect(4, 146, w - 8, 20));
+    text_layer_set_background_color(s_days_label, GColorClear);
+    text_layer_set_text_color(s_days_label, GColorDarkGray);
+    text_layer_set_text_alignment(s_days_label, GTextAlignmentCenter);
+    text_layer_set_font(s_days_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_14));
+    layer_add_child(root, text_layer_get_layer(s_days_label));
+
+    // ── Hint bar (bottom) ──
+    s_hint_label = text_layer_create(GRect(0, h - 18, w, 18));
+    text_layer_set_background_color(s_hint_label, GColorDarkGray);
+    text_layer_set_text_color(s_hint_label, GColorLightGray);
     text_layer_set_text_alignment(s_hint_label, GTextAlignmentCenter);
-    text_layer_set_font(s_hint_label, fonts_get_system_font(FONT_KEY_GOTHIC_14));
+    text_layer_set_font(s_hint_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_14));
     layer_add_child(root, text_layer_get_layer(s_hint_label));
 
     window_set_click_config_provider(window, click_config_provider);
+    (void)divider;  // suppress unused variable warning
 }
 
 static void main_window_unload(Window *window) {
-    text_layer_destroy(s_wake_label);
-    text_layer_destroy(s_icon_label);
-    text_layer_destroy(s_status_label);
+    text_layer_destroy(s_state_label);
+    text_layer_destroy(s_time_label);
+    text_layer_destroy(s_detail_label);
+    text_layer_destroy(s_days_label);
     text_layer_destroy(s_hint_label);
+    layer_destroy(s_state_bar);
 }
 
-// ─── App Lifecycle ────────────────────────────────────────────────────────────
+// ─── App lifecycle ────────────────────────────────────────────────────────────
 
 static void app_init(void) {
     wakeup_service_subscribe(wakeup_handler);
     app_worker_message_subscribe(worker_message_handler);
 
-    s_main_window = window_create();
-    window_set_background_color(s_main_window, GColorBlack);
+    // Update home screen every minute
+    tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+
+    s_win = window_create();
+    window_set_background_color(s_win, GColorBlack);
 
     WindowHandlers wh = {
         .load   = main_window_load,
+        .appear = main_window_appear,
         .unload = main_window_unload
     };
-    window_set_window_handlers(s_main_window, wh);
-    window_stack_push(s_main_window, true);
+    window_set_window_handlers(s_win, wh);
+    window_stack_push(s_win, true);
 
     // Ensure background worker is running
     AppWorkerResult res = app_worker_launch();
@@ -295,42 +455,40 @@ static void app_init(void) {
             "NapBuster: worker launch failed (result=%d)", res);
     }
 
-    // Handle wakeup launch (snooze expired)
+    // Wakeup launch → snooze expired
     if (launch_reason() == APP_LAUNCH_WAKEUP) {
         WakeupId wid;
         int32_t  cookie;
-        if (wakeup_get_launch_event(&wid, &cookie)) {
-            if (cookie == WAKEUP_REASON_SNOOZE) {
-                // Snooze expired → ring the alarm
-                persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
-                persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
-                start_alarm();
-                return;
-            }
+        if (wakeup_get_launch_event(&wid, &cookie) &&
+            cookie == WAKEUP_REASON_SNOOZE) {
+            persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
+            persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
+            start_alarm();
+            return;
         }
     }
 
-    // Handle worker launch (sleep detected)
+    // Worker launch → sleep detected
     if (launch_reason() == APP_LAUNCH_WORKER) {
         start_alarm();
         return;
     }
 
-    // Normal user launch → show status
-    update_status_display();
+    // Normal launch → draw home screen (appear handler fires after load)
 }
 
 static void app_deinit(void) {
+    tick_timer_service_unsubscribe();
     if (s_vibe_timer) {
         app_timer_cancel(s_vibe_timer);
         s_vibe_timer = NULL;
     }
     vibes_cancel();
     app_worker_message_unsubscribe();
-    window_destroy(s_main_window);
+    window_destroy(s_win);
 }
 
-// ─── Entry Point ─────────────────────────────────────────────────────────────
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 int main(void) {
     app_init();
