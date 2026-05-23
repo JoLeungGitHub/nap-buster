@@ -204,10 +204,7 @@ static void update_home_screen(void) {
         state = HOME_STATE_OFF_HOURS;
     }
 
-    // ── Current time string ──
-    static char time_buf[8];
-    clock_copy_time_string(time_buf, sizeof(time_buf));
-    text_layer_set_text(s_time_label, time_buf);
+    // ── Current time string (unused now, keeping for potential future use) ──
 
     // ── Days summary ──
     static char days_buf[12];
@@ -227,6 +224,7 @@ static void update_home_screen(void) {
             window_set_background_color(s_win, GColorBlack);
             text_layer_set_text_color(s_state_label, GColorIslamicGreen);
             text_layer_set_text(s_state_label,  "GUARDING");
+            text_layer_set_text(s_time_label,   "(^_^)");
             snprintf(detail_buf, sizeof(detail_buf), "%s", sched_buf);
             text_layer_set_text(s_detail_label, detail_buf);
             text_layer_set_text(s_days_label,   days_buf);
@@ -273,6 +271,7 @@ static void update_home_screen(void) {
             window_set_background_color(s_win, GColorBlack);
             text_layer_set_text_color(s_state_label, GColorLightGray);
             text_layer_set_text(s_state_label,  "OFF-HOURS");
+            text_layer_set_text(s_time_label,   "(-_-)");
             text_layer_set_text(s_detail_label, next_buf);
             text_layer_set_text(s_days_label,   days_buf);
             text_layer_set_text(s_hint_label,   "Hold SEL: settings");
@@ -284,6 +283,7 @@ static void update_home_screen(void) {
             window_set_background_color(s_win, GColorBlack);
             text_layer_set_text_color(s_state_label, GColorChromeYellow);
             text_layer_set_text(s_state_label, "SNOOZED");
+            text_layer_set_text(s_time_label,  "(- . -)z");
             snprintf(detail_buf, sizeof(detail_buf),
                      "Resuming in\n%d min", snooze_mins_left);
             text_layer_set_text(s_detail_label, detail_buf);
@@ -296,6 +296,7 @@ static void update_home_screen(void) {
             window_set_background_color(s_win, GColorBlack);
             text_layer_set_text_color(s_state_label, GColorDarkGray);
             text_layer_set_text(s_state_label,  "DISABLED");
+            text_layer_set_text(s_time_label,   "(._.)");
             snprintf(detail_buf, sizeof(detail_buf), "%s\n%s",
                      sched_buf, days_buf);
             text_layer_set_text(s_detail_label, detail_buf);
@@ -307,13 +308,7 @@ static void update_home_screen(void) {
     layer_mark_dirty(s_state_bar);
 }
 
-// ─── Tick handler (refreshes home every minute) ───────────────────────────────
-
-static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
-    update_home_screen();
-}
-
-// ─── Worker message handler ───────────────────────────────────────────────────
+// ─── Tick handler (kept as stub in case minute updates needed later) ─────────
 
 static void worker_message_handler(uint16_t type, AppWorkerMessage *msg) {
     if (type == WORKER_MSG_SLEEP_DETECTED) start_alarm();
@@ -378,13 +373,13 @@ static void main_window_load(Window *window) {
     Layer *divider = layer_create(GRect(8, 38, w - 16, 1));
     // We can't draw on it without update_proc, so just leave it as black gap
 
-    // ── Current time (big) ──
-    s_time_label = text_layer_create(GRect(0, 42, w, 52));
+    // ── ASCII face (replaces clock — not a watchface!) ──
+    s_time_label = text_layer_create(GRect(0, 38, w, 52));
     text_layer_set_background_color(s_time_label, GColorClear);
     text_layer_set_text_color(s_time_label, GColorWhite);
     text_layer_set_text_alignment(s_time_label, GTextAlignmentCenter);
     text_layer_set_font(s_time_label,
-        fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
+        fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
     layer_add_child(root, text_layer_get_layer(s_time_label));
 
     // ── Detail line (schedule / snooze countdown / next active time) ──
@@ -433,8 +428,8 @@ static void app_init(void) {
     wakeup_service_subscribe(wakeup_handler);
     app_worker_message_subscribe(worker_message_handler);
 
-    // Update home screen every minute
-    tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+    // No minute tick needed — face doesn't change on time, only on state changes
+    // tick_timer_service_subscribe removed to save battery
 
     s_win = window_create();
     window_set_background_color(s_win, GColorBlack);
@@ -478,7 +473,6 @@ static void app_init(void) {
 }
 
 static void app_deinit(void) {
-    tick_timer_service_unsubscribe();
     if (s_vibe_timer) {
         app_timer_cancel(s_vibe_timer);
         s_vibe_timer = NULL;
