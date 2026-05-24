@@ -342,9 +342,19 @@ static void click_config_provider(void *ctx) {
 
 // ─── Window lifecycle ────────────────────────────────────────────────────────
 
+static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
+    update_home_screen();
+}
+
 static void main_window_appear(Window *window) {
     // Refresh whenever window comes to front — catches settings changes
     update_home_screen();
+    // Subscribe to minute ticks while visible so emu-set-time refreshes the display
+    tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+}
+
+static void main_window_disappear(Window *window) {
+    tick_timer_service_unsubscribe();
 }
 
 static void main_window_load(Window *window) {
@@ -435,9 +445,10 @@ static void app_init(void) {
     window_set_background_color(s_win, GColorBlack);
 
     WindowHandlers wh = {
-        .load   = main_window_load,
-        .appear = main_window_appear,
-        .unload = main_window_unload
+        .load      = main_window_load,
+        .appear    = main_window_appear,
+        .disappear = main_window_disappear,
+        .unload    = main_window_unload
     };
     window_set_window_handlers(s_win, wh);
     window_stack_push(s_win, true);
