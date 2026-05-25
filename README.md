@@ -38,6 +38,7 @@ To check which version you have installed: open NapBuster → long-press SELECT 
 
 | Version | What changed |
 |---|---|
+| **1.2.0** | Tier 1 now piggybacks on OS HR events (zero extra battery); 5-min timer only fires if no HR event arrived recently (handles slow/disabled background sampling) |
 | **1.1.0** | Two-tier detection: HR+accel early warning on Time 2/Pebble 2; HealthService sleep event as fallback on all platforms |
 | 1.0.0 | Initial release — HealthService sleep event detection only |
 

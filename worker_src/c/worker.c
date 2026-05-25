@@ -1,17 +1,18 @@
 /**
- * worker.c — NapBuster Background Worker v2
+ * worker.c — NapBuster Background Worker v3
  *
  * Two-tier sleep detection:
  *
  *   TIER 1 (HR-capable platforms: emery/diorite)
  *   ─────────────────────────────────────────────
- *   Every 5 minutes inside the guard window:
- *     • Sample HR via health_service_peek_current_value(HealthMetricHeartRateBPM)
- *     • Sample accel via accel_service_peek() → integer magnitude
+ *   Piggybacks on HealthEventHeartRateUpdate (free — OS was already waking for HR):
+ *     • On every HR event: read HR + accel, run analysis immediately
+ *     • 5-min fallback timer: only runs analysis if no HR event arrived recently
+ *       (handles users with slow/disabled background HR sampling setting)
  *     • Maintain 8-sample rolling HR circular buffer (persisted)
  *     • Update accel EMA
  *     • If HR drops >13% below rolling avg AND accel is still for ≥2 consecutive
- *       5-min checks → fire alarm ~10-15 min into a nap (much earlier than native)
+ *       detections → fire alarm ~10-15 min into a nap (much earlier than native)
  *
  *   TIER 2 (ALL platforms including HR-capable)
  *   ─────────────────────────────────────────────
@@ -75,7 +76,8 @@
 #define ACCEL_STILL_THRESH   200     // milli-g deviation from EMA = "still"
 #define ACCEL_EMA_ALPHA      8       // EMA weight: new = (old*(ALPHA-1) + new) / ALPHA
 #define STREAK_TO_FIRE       2       // consecutive detections before alarm
-#define SAMPLE_INTERVAL_MS   300000  // 5 minutes in ms
+#define SAMPLE_INTERVAL_MS   300000  // 5 minutes in ms (fallback timer)
+#define SAMPLE_INTERVAL_SECS 300     // same in seconds (for recency check)
 #define WINDOW_CHECK_MS      60000   // 1 minute window boundary check
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -105,6 +107,10 @@ static uint8_t  s_trigger_streak = 0;
 
 // Tier-1 accel EMA (milli-g)
 static int32_t  s_accel_avg    = 0;
+
+// Timestamp of last HealthEventHeartRateUpdate (0 = never)
+// Used by the fallback timer to avoid duplicate analysis
+static time_t   s_last_hr_event_time = 0;
 
 // ─── Integer sqrt (Newton's method — no math.h needed) ───────────────────────
 
@@ -250,7 +256,95 @@ static void prv_try_launch_foreground(void) {
     app_worker_send_message(WORKER_MSG_SLEEP_DETECTED, &msg);
 }
 
-// ─── Tier-1 Sample Timer ──────────────────────────────────────────────────────
+
+// ─── Tier-1 Analysis (shared by HR event path and fallback timer) ─────────────
+
+/**
+ * Core Tier-1 analysis: called with a fresh HR reading (or 0 if unavailable).
+ * Samples accel, updates rolling buffers, evaluates trigger conditions.
+ * hr_val: current BPM from either HealthEventHeartRateUpdate or a fresh peek.
+ */
+static void prv_run_tier1_analysis(int16_t hr_val) {
+    // ── 1. Sample accelerometer ───────────────────────────────────────────────
+    AccelData accel = {0};
+    int32_t current_mag = 0;
+    if (accel_service_peek(&accel) == 0) {
+        int64_t sq = (int64_t)accel.x * accel.x
+                   + (int64_t)accel.y * accel.y
+                   + (int64_t)accel.z * accel.z;
+        current_mag = prv_isqrt(sq);
+    } else {
+        APP_LOG(APP_LOG_LEVEL_WARNING, "NapBuster worker: accel_service_peek failed");
+        current_mag = s_accel_avg;  // use EMA — don't false-trigger "still"
+    }
+
+    // ── 2. Update accel EMA ───────────────────────────────────────────────────
+    if (s_accel_avg == 0) {
+        s_accel_avg = current_mag;  // seed on first reading
+    } else {
+        s_accel_avg = (s_accel_avg * (ACCEL_EMA_ALPHA - 1) + current_mag)
+                      / ACCEL_EMA_ALPHA;
+    }
+
+    // ── 3. Update HR circular buffer ─────────────────────────────────────────
+    if (hr_val > 0) {
+        s_hr_buf[s_hr_buf_idx] = hr_val;
+        s_hr_buf_idx = (s_hr_buf_idx + 1) % HR_BUF_SIZE;
+        if (s_hr_buf_count < HR_BUF_SIZE) s_hr_buf_count++;
+    }
+
+    // ── 4. Compute rolling HR average and check drop ──────────────────────────
+    bool hr_drop = false;
+    if (hr_val > 0 && s_hr_buf_count >= 3) {
+        int32_t sum = 0;
+        for (uint8_t i = 0; i < s_hr_buf_count; i++) sum += s_hr_buf[i];
+        int32_t rolling_avg = sum / s_hr_buf_count;
+        hr_drop = ((int32_t)hr_val * 100) < (rolling_avg * HR_DROP_PCT);
+        APP_LOG(APP_LOG_LEVEL_DEBUG,
+            "NapBuster Tier1: HR=%d avg=%d hr_drop=%d",
+            (int)hr_val, (int)rolling_avg, (int)hr_drop);
+    } else {
+        APP_LOG(APP_LOG_LEVEL_DEBUG,
+            "NapBuster Tier1: HR=%d buf_count=%d (need >=3)",
+            (int)hr_val, (int)s_hr_buf_count);
+    }
+
+    // ── 5. Stillness check ────────────────────────────────────────────────────
+    int32_t accel_dev = current_mag - s_accel_avg;
+    if (accel_dev < 0) accel_dev = -accel_dev;
+    bool still = (accel_dev < ACCEL_STILL_THRESH);
+    APP_LOG(APP_LOG_LEVEL_DEBUG,
+        "NapBuster Tier1: mag=%d ema=%d dev=%d still=%d",
+        (int)current_mag, (int)s_accel_avg, (int)accel_dev, (int)still);
+
+    // ── 6. Update trigger streak ──────────────────────────────────────────────
+    if (hr_drop && still) {
+        s_trigger_streak++;
+        APP_LOG(APP_LOG_LEVEL_INFO,
+            "NapBuster Tier1: trigger streak=%d (need %d)",
+            (int)s_trigger_streak, STREAK_TO_FIRE);
+    } else {
+        if (s_trigger_streak > 0) {
+            APP_LOG(APP_LOG_LEVEL_DEBUG,
+                "NapBuster Tier1: streak reset (hr_drop=%d still=%d)",
+                (int)hr_drop, (int)still);
+        }
+        s_trigger_streak = 0;
+    }
+
+    // ── 7. Fire if streak threshold reached ───────────────────────────────────
+    if (s_trigger_streak >= STREAK_TO_FIRE) {
+        APP_LOG(APP_LOG_LEVEL_INFO,
+            "NapBuster Tier1: sleep detected — HR+accel threshold reached");
+        s_trigger_streak = 0;  // reset so post-snooze doze-off can re-trigger
+        prv_try_launch_foreground();
+    }
+
+    // ── 8. Persist all Tier-1 state ───────────────────────────────────────────
+    prv_save_hr_state();
+}
+
+// ─── Tier-1 Fallback Sample Timer ────────────────────────────────────────────
 
 static void prv_sample_timer_callback(void *ctx);  // fwd
 
@@ -268,112 +362,34 @@ static void prv_stop_sample_timer(void) {
 }
 
 /**
- * Fires every 5 minutes while inside the guard window AND s_hr_capable.
+ * Fallback timer — fires every 5 minutes while inside the guard window.
  *
- * 1. Sample HR + accel
- * 2. Update rolling buffers
- * 3. Check two-condition trigger (hr_drop AND still)
- * 4. Fire alarm if streak >= STREAK_TO_FIRE
- * 5. Persist all state
+ * Skips analysis entirely if a HealthEventHeartRateUpdate arrived recently
+ * (analysis already ran at that point — piggybacking was free, no duplication).
+ * Only peeks HR ourselves when the OS hasn't sent an update, i.e. the user
+ * has background HR sampling set to 30 min / 1 hour / off.
  */
 static void prv_sample_timer_callback(void *ctx) {
-    s_sample_timer = NULL;  // timer fired, clear handle
+    s_sample_timer = NULL;
 
-    // ── 1. Sample heart rate ──────────────────────────────────────────────────
-    HealthValue hr_val =
-        health_service_peek_current_value(HealthMetricHeartRateBPM);
-    int16_t current_hr = (hr_val > 0) ? (int16_t)hr_val : 0;
+    time_t now = time(NULL);
+    bool had_recent_event = (s_last_hr_event_time > 0) &&
+                            (now - s_last_hr_event_time < SAMPLE_INTERVAL_SECS);
 
-    // ── 2. Sample accelerometer ───────────────────────────────────────────────
-    AccelData accel = {0};
-    int32_t current_mag = 0;
-    if (accel_service_peek(&accel) == 0) {
-        // Compute magnitude sqrt(x²+y²+z²) in milli-g
-        int64_t sq = (int64_t)accel.x * accel.x
-                   + (int64_t)accel.y * accel.y
-                   + (int64_t)accel.z * accel.z;
-        current_mag = prv_isqrt(sq);
-    } else {
-        APP_LOG(APP_LOG_LEVEL_WARNING,
-            "NapBuster worker: accel_service_peek failed");
-        // Use EMA as fallback so we don't get a false "still" reading
-        current_mag = s_accel_avg;
-    }
-
-    // ── 3. Update accel EMA ───────────────────────────────────────────────────
-    if (s_accel_avg == 0) {
-        // First reading — seed EMA
-        s_accel_avg = current_mag;
-    } else {
-        s_accel_avg = (s_accel_avg * (ACCEL_EMA_ALPHA - 1) + current_mag)
-                      / ACCEL_EMA_ALPHA;
-    }
-
-    // ── 4. Update HR circular buffer ─────────────────────────────────────────
-    if (current_hr > 0) {
-        s_hr_buf[s_hr_buf_idx] = current_hr;
-        s_hr_buf_idx = (s_hr_buf_idx + 1) % HR_BUF_SIZE;
-        if (s_hr_buf_count < HR_BUF_SIZE) s_hr_buf_count++;
-    }
-
-    // ── 5. Compute rolling HR average ─────────────────────────────────────────
-    bool hr_drop = false;
-    if (current_hr > 0 && s_hr_buf_count >= 3) {
-        int32_t sum = 0;
-        for (uint8_t i = 0; i < s_hr_buf_count; i++) {
-            sum += s_hr_buf[i];
-        }
-        int32_t rolling_avg = sum / s_hr_buf_count;
-
-        // Trigger if current HR is more than 13% below recent rolling average
-        hr_drop = ((int32_t)current_hr * 100) < (rolling_avg * HR_DROP_PCT);
-
+    if (had_recent_event) {
         APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: HR=%d avg=%d hr_drop=%d",
-            (int)current_hr, (int)rolling_avg, (int)hr_drop);
+            "NapBuster Tier1 timer: HR event ran analysis %ds ago — skipping",
+            (int)(now - s_last_hr_event_time));
     } else {
+        // No recent HR event — do our own peek
         APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: HR=%d buf_count=%d (need >=3)",
-            (int)current_hr, (int)s_hr_buf_count);
+            "NapBuster Tier1 timer: no recent HR event — peeking HR");
+        HealthValue hr_val =
+            health_service_peek_current_value(HealthMetricHeartRateBPM);
+        prv_run_tier1_analysis((hr_val > 0) ? (int16_t)hr_val : 0);
     }
 
-    // ── 6. Stillness check ────────────────────────────────────────────────────
-    int32_t accel_dev = current_mag - s_accel_avg;
-    if (accel_dev < 0) accel_dev = -accel_dev;
-    bool still = (accel_dev < ACCEL_STILL_THRESH);
-
-    APP_LOG(APP_LOG_LEVEL_DEBUG,
-        "NapBuster Tier1: mag=%d ema=%d dev=%d still=%d",
-        (int)current_mag, (int)s_accel_avg, (int)accel_dev, (int)still);
-
-    // ── 7. Update trigger streak ──────────────────────────────────────────────
-    if (hr_drop && still) {
-        s_trigger_streak++;
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster Tier1: trigger streak=%d (need %d)",
-            (int)s_trigger_streak, STREAK_TO_FIRE);
-    } else {
-        if (s_trigger_streak > 0) {
-            APP_LOG(APP_LOG_LEVEL_DEBUG,
-                "NapBuster Tier1: streak reset (hr_drop=%d still=%d)",
-                (int)hr_drop, (int)still);
-        }
-        s_trigger_streak = 0;
-    }
-
-    // ── 8. Fire if streak threshold reached ───────────────────────────────────
-    if (s_trigger_streak >= STREAK_TO_FIRE) {
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster Tier1: sleep detected — HR+accel threshold reached");
-        s_trigger_streak = 0;  // reset so a post-snooze doze-off can re-trigger
-        prv_try_launch_foreground();
-    }
-
-    // ── 9. Persist all Tier-1 state ───────────────────────────────────────────
-    prv_save_hr_state();
-
-    // ── 10. Re-arm for next 5-minute sample ───────────────────────────────────
-    prv_start_sample_timer();
+    prv_start_sample_timer();  // re-arm
 }
 
 // ─── Window Boundary Timer ────────────────────────────────────────────────────
@@ -436,23 +452,29 @@ static void prv_window_timer_callback(void *ctx) {
     prv_start_window_timer();
 }
 
-// ─── Tier-2 HealthService Callback ───────────────────────────────────────────
+// ─── HealthService Callback (Tier 1 fast path + Tier 2 fallback) ─────────────
 
 static void prv_health_event_handler(HealthEventType event, void *ctx) {
-    // Event-driven — fires when Pebble's health engine emits a state change.
-    HealthActivityMask activities = health_service_peek_current_activities();
+    if (event == HealthEventHeartRateUpdate && s_hr_capable) {
+        // ── Tier 1 fast path — piggyback on OS HR sample (zero extra battery) ──
+        HealthValue hr_val =
+            health_service_peek_current_value(HealthMetricHeartRateBPM);
+        s_last_hr_event_time = time(NULL);
+        APP_LOG(APP_LOG_LEVEL_DEBUG,
+            "NapBuster Tier1: HR event — BPM=%d", (int)hr_val);
+        prv_run_tier1_analysis((hr_val > 0) ? (int16_t)hr_val : 0);
+        return;
+    }
 
+    // ── Tier 2 — sleep confirmation event (all platforms) ────────────────────
+    HealthActivityMask activities = health_service_peek_current_activities();
     bool is_sleeping = (activities & HealthActivitySleep) ||
                        (activities & HealthActivityRestfulSleep);
 
     if (is_sleeping) {
-        if (s_hr_capable) {
-            APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster Tier2 (fallback): sleep event on HR-capable platform");
-        } else {
-            APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster Tier2: sleep event detected");
-        }
+        APP_LOG(APP_LOG_LEVEL_INFO,
+            s_hr_capable ? "NapBuster Tier2 (fallback): sleep confirmed"
+                         : "NapBuster Tier2: sleep confirmed");
         prv_try_launch_foreground();
     } else {
         // User is awake — reset so a future doze-off can re-trigger
@@ -498,7 +520,7 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
 // ─── Worker Lifecycle ─────────────────────────────────────────────────────────
 
 static void worker_init(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v2: starting");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v3: starting");
 
     app_worker_message_subscribe(prv_app_message_handler);
 
@@ -549,7 +571,7 @@ static void worker_init(void) {
 }
 
 static void worker_deinit(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v2: stopping");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v3: stopping");
 
     prv_stop_sample_timer();
     prv_stop_window_timer();
