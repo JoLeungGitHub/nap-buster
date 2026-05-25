@@ -13,12 +13,15 @@ NapBuster runs a **background worker** with two-tier sleep detection:
 ```
 Background worker (always running)
     │
-    ├─ TIER 1: HR + accelerometer sampled every 5 min (Pebble Time 2 / Pebble 2)
-    │       HR drops >13% below rolling average AND wrist is still?
-    │       Two consecutive detections? ──Yes──▶ fire alarm (~10–15 min latency)
+    ├─ TIER 1: Piggybacks on OS heart rate events (Pebble Time 2 / Pebble 2)
+    │       OS takes HR sample → HealthEventHeartRateUpdate fires for free
+    │           └──▶ read HR + accel, run analysis immediately
+    │       5-min fallback timer (only fires if no HR event arrived recently)
+    │           └──▶ peek HR ourselves (handles slow/off background sampling)
+    │       Two consecutive detections of HR drop + stillness? ──▶ alarm (~10–15 min)
     │
-    ├─ TIER 2: Pebble HealthService sleep event (all platforms, fallback)
-    │       OS confirms sleep ──▶ fire alarm (45–90 min latency, but reliable)
+    ├─ TIER 2: Pebble HealthService sleep confirmation (all platforms, fallback)
+    │       OS confirms sleep ──▶ alarm (45–90 min latency, but reliable)
     │
     └─ Alarm fires ──▶ launch foreground app
                            │
@@ -28,7 +31,7 @@ Background worker (always running)
                            └─ DOWN   ──▶ snooze 30 min
 ```
 
-**Battery efficient:** sensors only active during your guard window. Outside those hours the worker idles with just a 60-second clock check.
+**Battery efficient:** Tier 1 piggybacks on HR samples the OS was already taking — no extra CPU wakes. The 5-min fallback timer almost never does real work on the default 10-min sampling setting. All sensors are idle outside your guard window.
 
 ---
 
@@ -46,14 +49,14 @@ To check which version you have installed: open NapBuster → long-press SELECT 
 
 ## Features
 
-- 🔬 **Early nap detection** — HR + accelerometer analysis catches nap onset in ~10–15 min (Pebble Time 2 / Pebble 2)
+- 🔬 **Early nap detection** — piggybacks on OS HR events + accel to catch nap onset in ~10–15 min (Pebble Time 2 / Pebble 2)
 - 🛡️ **Fallback detection** — Pebble's native sleep confirmation as a safety net on all platforms
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed
 - 💤 **Snooze** — 10 or 30 minutes, re-arms automatically via Wakeup API (survives app close)
 - 📅 **Per-day schedule** — pick exactly which days to guard
 - 🕐 **Configurable no-nap hours** — set your own start and end time
 - 💪 **Vibration strength** — Gentle / Medium / Strong
-- 🔋 **Battery efficient** — sensors only active during guarded hours
+- 🔋 **Battery efficient** — Tier 1 rides free on HR samples the OS was already taking; sensors fully idle outside guard window
 
 ---
 
@@ -178,9 +181,9 @@ nap-buster/
 
 ### Key design decisions
 
-**Two-tier detection** — Tier 1 (HR + accelerometer, every 5 min) fires ~10–15 min into nap onset. Tier 2 (HealthService sleep event) is a belt-and-suspenders fallback. HR capability is detected at runtime — no `#ifdef` needed.
+**Two-tier detection** — Tier 1 piggybacks on `HealthEventHeartRateUpdate` (zero extra battery — the OS was already waking the CPU for the HR sample). Analysis runs immediately on each event: HR is compared against a rolling 8-sample average, accel magnitude is checked against an EMA baseline. A 5-min fallback timer only peeks HR itself when no OS event arrived recently, covering users with slow or disabled background HR sampling. Tier 2 (HealthService sleep confirmation) runs alongside as a belt-and-suspenders fallback. HR capability is detected at runtime — no `#ifdef` needed.
 
-**Rolling HR buffer** — 8 samples × 5 min = ~40 min of history. Compared against a rolling average rather than a fixed baseline, so the threshold self-adjusts to your actual resting HR throughout the day.
+**Rolling HR buffer** — 8 samples of history (≈40–80 min depending on OS sampling rate). Compared against a rolling average rather than a fixed baseline, so the threshold self-adjusts to your actual resting HR throughout the day.
 
 **`common.h` is the single source of truth** for all persist keys, default values, vibration patterns, and the `is_in_no_nap_window()` helper.
 
