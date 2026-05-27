@@ -41,6 +41,7 @@ To check which version you have installed: open NapBuster → long-press SELECT 
 
 | Version | What changed |
 |---|---|
+| **1.3.0** | Alarm screen has per-button labels (UP/SEL/DN) instead of cramped single hint; Tier 1 HR buffer now stays warm outside the guard window so detection can fire immediately at window open |
 | **1.2.0** | Tier 1 now piggybacks on OS HR events (zero extra battery); 5-min timer only fires if no HR event arrived recently (handles slow/disabled background sampling) |
 | **1.1.0** | Two-tier detection: HR+accel early warning on Time 2/Pebble 2; HealthService sleep event as fallback on all platforms |
 | 1.0.0 | Initial release — HealthService sleep event detection only |
@@ -102,11 +103,11 @@ The settings row shows a smart summary: `Every day`, `Weekdays`, `Weekends`, or 
 | SELECT (long press) | Open settings |
 
 ### Alarm screen (when nap detected)
-| Button | Action |
-|---|---|
-| SELECT | Dismiss alarm |
-| UP | Snooze 10 minutes |
-| DOWN | Snooze 30 minutes |
+| Button | Action | Label shown |
+|---|---|---|
+| UP | Snooze 10 minutes | `snooze 10m ▲` |
+| SELECT | Dismiss alarm | `dismiss ●` |
+| DOWN | Snooze 30 minutes | `snooze 30m ▼` |
 
 ---
 

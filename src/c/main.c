@@ -46,6 +46,11 @@ static TextLayer *s_detail_label = NULL;  // schedule / snooze info
 static TextLayer *s_days_label   = NULL;  // days summary
 static TextLayer *s_hint_label   = NULL;  // bottom hint
 
+// ── Alarm side-button labels (shown only during alarm, on red bg) ──
+static TextLayer *s_up_label     = NULL;  // UP button label
+static TextLayer *s_sel_label    = NULL;  // SELECT button label
+static TextLayer *s_dn_label     = NULL;  // DOWN button label
+
 // ─── Runtime state ───────────────────────────────────────────────────────────
 
 static AppTimer *s_vibe_timer  = NULL;
@@ -113,8 +118,15 @@ static void start_alarm(void) {
     text_layer_set_text(s_time_label,   "(>_<)");
     text_layer_set_text(s_detail_label, "You dozed off!");
     text_layer_set_text(s_days_label,   "");
-    text_layer_set_text(s_hint_label,
-        "SEL: dismiss\nUP: +10 min\nDN: +30 min");
+    text_layer_set_text(s_hint_label,   "");  // side labels take over
+
+    // ── Alarm side-button labels (white on red background) ──
+    text_layer_set_text_color(s_up_label,  GColorWhite);
+    text_layer_set_text_color(s_sel_label, GColorWhite);
+    text_layer_set_text_color(s_dn_label,  GColorWhite);
+    text_layer_set_text(s_up_label,  "snooze 10m \xe2\x96\xb2");
+    text_layer_set_text(s_sel_label, "dismiss \xe2\x97\x8f");
+    text_layer_set_text(s_dn_label,  "snooze 30m \xe2\x96\xbc");
 
     s_bar_color = GColorRed;
     layer_mark_dirty(s_state_bar);
@@ -173,6 +185,14 @@ static void prv_state_bar_update(Layer *layer, GContext *ctx) {
 /** Determine current state and refresh all home screen layers. */
 static void update_home_screen(void) {
     if (s_is_alarming) return;
+
+    // ── Clear alarm side-button labels and restore normal colors ──
+    text_layer_set_text_color(s_up_label,  GColorLightGray);
+    text_layer_set_text_color(s_sel_label, GColorLightGray);
+    text_layer_set_text_color(s_dn_label,  GColorLightGray);
+    text_layer_set_text(s_up_label,  "");
+    text_layer_set_text(s_sel_label, "");
+    text_layer_set_text(s_dn_label,  "");
 
     // ── Read current settings ──
     bool enabled     = settings_get_enabled();
@@ -419,6 +439,33 @@ static void main_window_load(Window *window) {
         fonts_get_system_font(FONT_KEY_GOTHIC_14));
     layer_add_child(root, text_layer_get_layer(s_hint_label));
 
+    // ── Alarm side-button labels (right edge, one per physical button) ──
+    // Pebble Time 2 (emery): 200×228px
+    // Button vertical centres: UP≈57, SEL≈114, DN≈171
+    s_up_label = text_layer_create(GRect(w - 80, 57 - 9, 80, 18));
+    text_layer_set_background_color(s_up_label, GColorClear);
+    text_layer_set_text_color(s_up_label, GColorLightGray);
+    text_layer_set_text_alignment(s_up_label, GTextAlignmentRight);
+    text_layer_set_font(s_up_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_14));
+    layer_add_child(root, text_layer_get_layer(s_up_label));
+
+    s_sel_label = text_layer_create(GRect(w - 80, 114 - 9, 80, 18));
+    text_layer_set_background_color(s_sel_label, GColorClear);
+    text_layer_set_text_color(s_sel_label, GColorLightGray);
+    text_layer_set_text_alignment(s_sel_label, GTextAlignmentRight);
+    text_layer_set_font(s_sel_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_14));
+    layer_add_child(root, text_layer_get_layer(s_sel_label));
+
+    s_dn_label = text_layer_create(GRect(w - 80, 171 - 9, 80, 18));
+    text_layer_set_background_color(s_dn_label, GColorClear);
+    text_layer_set_text_color(s_dn_label, GColorLightGray);
+    text_layer_set_text_alignment(s_dn_label, GTextAlignmentRight);
+    text_layer_set_font(s_dn_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_14));
+    layer_add_child(root, text_layer_get_layer(s_dn_label));
+
     window_set_click_config_provider(window, click_config_provider);
     (void)divider;  // suppress unused variable warning
 }
@@ -429,6 +476,9 @@ static void main_window_unload(Window *window) {
     text_layer_destroy(s_detail_label);
     text_layer_destroy(s_days_label);
     text_layer_destroy(s_hint_label);
+    text_layer_destroy(s_up_label);
+    text_layer_destroy(s_sel_label);
+    text_layer_destroy(s_dn_label);
     layer_destroy(s_state_bar);
 }
 

@@ -203,6 +203,7 @@ static void prv_load_hr_state(void) {
                         ? (int32_t)persist_read_int(PERSIST_KEY_ACCEL_AVG)      : 0;
 }
 
+static void prv_reset_hr_state(void) __attribute__((unused));
 static void prv_reset_hr_state(void) {
     memset(s_hr_buf, 0, sizeof(s_hr_buf));
     s_hr_buf_idx     = 0;
@@ -421,15 +422,16 @@ static void prv_window_timer_callback(void *ctx) {
 
     if (in_window && !s_health_subscribed) {
         // ── Window just opened ────────────────────────────────────────────────
-        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: window opened");
+        APP_LOG(APP_LOG_LEVEL_INFO,
+            "NapBuster worker: window opened — HR buffer has %d readings (warm baseline)",
+            (int)s_hr_buf_count);
 
         // Subscribe Tier-2 health events
         prv_subscribe_health();
 
-        // Start Tier-1 sample timer on HR-capable platforms
+        // Start Tier-1 sample timer on HR-capable platforms (may already be running)
         if (s_hr_capable) {
-            // Fresh baseline — don't carry stale HR from outside the window
-            prv_reset_hr_state();
+            // Do NOT reset HR state — carry the existing warm baseline in
             prv_start_sample_timer();
         }
 
@@ -545,12 +547,24 @@ static void worker_init(void) {
 
     bool in_window = prv_get_enabled() && prv_is_in_window();
 
+    if (s_hr_capable) {
+        // ── Always subscribe health and start sample timer on HR-capable platforms ──
+        // This keeps the HR buffer warm BEFORE the window opens, so we have a
+        // full rolling baseline the moment guarding begins.
+        // prv_try_launch_foreground() checks prv_is_in_window() so the alarm
+        // CANNOT fire outside the window — collecting data outside is safe.
+        prv_subscribe_health();
+        prv_start_sample_timer();
+        APP_LOG(APP_LOG_LEVEL_INFO,
+            "NapBuster worker v3: HR-capable — sampling always-on for warm baseline");
+    }
+
     if (in_window) {
-        // Subscribe Tier-2 health events immediately
+        // Subscribe Tier-2 health events (no-op if already subscribed above)
         prv_subscribe_health();
 
         if (s_hr_capable) {
-            // Start Tier-1 sample timer
+            // Sample timer already started above — start is idempotent
             prv_start_sample_timer();
         }
 
