@@ -18,12 +18,20 @@
 #define PERSIST_KEY_VIBE_STRENGTH    7  // int:  0=Gentle 1=Medium 2=Strong
 #define PERSIST_KEY_ACTIVE_DAYS      8  // uint8 bitmask: bit0=Sun..bit6=Sat
 
+// ─── Tier-1 debug / tuning persist keys ──────────────────────────────────────
+#define PERSIST_KEY_TRIGGER_STREAK   13  // uint8: Tier-1 consecutive trigger count
+#define PERSIST_KEY_DEBUG_HR         15  // int16: last sampled HR BPM
+#define PERSIST_KEY_DEBUG_AVG        16  // int16: rolling HR average
+#define PERSIST_KEY_DEBUG_ACCEL      17  // int32: last accel deviation from EMA
+#define PERSIST_KEY_SENSITIVITY      18  // int: 0=Sensitive 1=Balanced 2=Conservative
+
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
 #define DEFAULT_START_HOUR           11  // 11:00 AM
 #define DEFAULT_END_HOUR             23  // 11:00 PM
 #define DEFAULT_VIBE_STRENGTH        1   // Medium
 #define DEFAULT_ACTIVE_DAYS          0x7F  // every day (bits 0-6 set)
+#define DEFAULT_SENSITIVITY          1   // Balanced (13% drop)
 
 // ─── Worker / App Message Keys ────────────────────────────────────────────────
 #define WORKER_MSG_SLEEP_DETECTED    0
@@ -93,6 +101,21 @@ static inline int settings_get_vibe_strength(void) {
 static inline uint8_t settings_get_active_days(void) {
     if (!persist_exists(PERSIST_KEY_ACTIVE_DAYS)) return DEFAULT_ACTIVE_DAYS;
     return (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS);
+}
+
+static inline int settings_get_sensitivity(void) {
+    if (!persist_exists(PERSIST_KEY_SENSITIVITY)) return DEFAULT_SENSITIVITY;
+    return persist_read_int(PERSIST_KEY_SENSITIVITY);
+}
+
+/** Map sensitivity level to the HR-drop percentage threshold.
+ *  hr_val * 100 < rolling_avg * threshold  →  drop detected. */
+static inline int sensitivity_to_drop_pct(int level) {
+    switch (level) {
+        case 0: return 92;  // Sensitive:     8% drop triggers
+        case 2: return 80;  // Conservative: 20% drop triggers
+        default: return 87; // Balanced:     13% drop triggers
+    }
 }
 
 // ─── Window / Time Helpers ────────────────────────────────────────────────────

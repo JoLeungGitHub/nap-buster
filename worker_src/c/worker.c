@@ -54,6 +54,15 @@
 #define PERSIST_KEY_TRIGGER_STREAK    13  // uint8_t consecutive trigger count
 #define PERSIST_KEY_ACCEL_AVG         14  // int32_t EMA of accel magnitude
 
+// Tier-1 debug telemetry (written each analysis cycle, read by foreground app)
+#define PERSIST_KEY_DEBUG_HR          15  // int16: last sampled HR BPM
+#define PERSIST_KEY_DEBUG_AVG         16  // int16: rolling HR average
+#define PERSIST_KEY_DEBUG_ACCEL       17  // int32: last accel deviation from EMA
+
+// Detection sensitivity (shared with foreground app)
+#define PERSIST_KEY_SENSITIVITY       18  // int: 0=Sensitive 1=Balanced 2=Conservative
+#define DEFAULT_SENSITIVITY           1   // Balanced
+
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
 #define DEFAULT_ENABLED                1
@@ -140,6 +149,18 @@ static int prv_get_start_hour(void) {
 static int prv_get_end_hour(void) {
     if (!persist_exists(PERSIST_KEY_END_HOUR)) return DEFAULT_END_HOUR;
     return persist_read_int(PERSIST_KEY_END_HOUR);
+}
+
+/** Return the HR-drop threshold percentage based on persisted sensitivity. */
+static int prv_get_hr_drop_pct(void) {
+    int level = persist_exists(PERSIST_KEY_SENSITIVITY)
+                ? persist_read_int(PERSIST_KEY_SENSITIVITY)
+                : DEFAULT_SENSITIVITY;
+    switch (level) {
+        case 0: return 92;  // Sensitive:     8% drop
+        case 2: return 80;  // Conservative: 20% drop
+        default: return 87; // Balanced:     13% drop
+    }
 }
 
 static bool prv_is_in_window(void) {
@@ -296,11 +317,13 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
 
     // ── 4. Compute rolling HR average and check drop ──────────────────────────
     bool hr_drop = false;
+    int32_t rolling_avg = 0;
     if (hr_val > 0 && s_hr_buf_count >= 3) {
         int32_t sum = 0;
         for (uint8_t i = 0; i < s_hr_buf_count; i++) sum += s_hr_buf[i];
-        int32_t rolling_avg = sum / s_hr_buf_count;
-        hr_drop = ((int32_t)hr_val * 100) < (rolling_avg * HR_DROP_PCT);
+        rolling_avg = sum / s_hr_buf_count;
+        int drop_pct = prv_get_hr_drop_pct();
+        hr_drop = ((int32_t)hr_val * 100) < (rolling_avg * drop_pct);
         APP_LOG(APP_LOG_LEVEL_DEBUG,
             "NapBuster Tier1: HR=%d avg=%d hr_drop=%d",
             (int)hr_val, (int)rolling_avg, (int)hr_drop);
@@ -342,6 +365,10 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
     }
 
     // ── 8. Persist all Tier-1 state ───────────────────────────────────────────
+    // Write debug telemetry for the foreground display
+    persist_write_int(PERSIST_KEY_DEBUG_HR,    (int)hr_val);
+    persist_write_int(PERSIST_KEY_DEBUG_AVG,   (int)rolling_avg);
+    persist_write_int(PERSIST_KEY_DEBUG_ACCEL, (int)accel_dev);
     prv_save_hr_state();
 }
 

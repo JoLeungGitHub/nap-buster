@@ -41,6 +41,7 @@ To check which version you have installed: open NapBuster → long-press SELECT 
 
 | Version | What changed |
 |---|---|
+| **1.4.0** | Debug telemetry on GUARDING screen (`HR:68 avg:74 d:142 x1`); Detection sensitivity setting (Sensitive/Balanced/Conservative) |
 | **1.3.0** | Alarm screen has per-button labels (UP/SEL/DN) instead of cramped single hint; Tier 1 HR buffer now stays warm outside the guard window so detection can fire immediately at window open |
 | **1.2.0** | Tier 1 now piggybacks on OS HR events (zero extra battery); 5-min timer only fires if no HR event arrived recently (handles slow/disabled background sampling) |
 | **1.1.0** | Two-tier detection: HR+accel early warning on Time 2/Pebble 2; HealthService sleep event as fallback on all platforms |
@@ -72,6 +73,7 @@ Open settings from the main screen with a **long-press on SELECT**.
 | **No-nap from** | Start of the no-nap window | 11:00 |
 | **No-nap until** | End of the no-nap window | 23:00 |
 | **Wake vibration** | Alarm intensity | Medium |
+| **Detection** | HR drop sensitivity (Sensitive=8% / Balanced=13% / Conservative=20%) | Balanced |
 
 ### Active days picker
 

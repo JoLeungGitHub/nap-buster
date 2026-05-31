@@ -45,6 +45,7 @@ static TextLayer *s_time_label   = NULL;  // current time HH:MM
 static TextLayer *s_detail_label = NULL;  // schedule / snooze info
 static TextLayer *s_days_label   = NULL;  // days summary
 static TextLayer *s_hint_label   = NULL;  // bottom hint
+static TextLayer *s_debug_label  = NULL;  // debug telemetry (GUARDING only)
 
 // ── Alarm side-button labels (shown only during alarm, on red bg) ──
 static TextLayer *s_up_label     = NULL;  // UP button label
@@ -326,6 +327,29 @@ static void update_home_screen(void) {
     }
 
     layer_mark_dirty(s_state_bar);
+
+    // ── Debug telemetry display (GUARDING state only) ──
+    static char debug_buf[32];
+    if (state == HOME_STATE_GUARDING) {
+        int16_t dbg_hr  = persist_exists(PERSIST_KEY_DEBUG_HR)
+                          ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_HR) : 0;
+        int16_t dbg_avg = persist_exists(PERSIST_KEY_DEBUG_AVG)
+                          ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_AVG) : 0;
+        int32_t dbg_acc = persist_exists(PERSIST_KEY_DEBUG_ACCEL)
+                          ? persist_read_int(PERSIST_KEY_DEBUG_ACCEL) : 0;
+        uint8_t streak  = persist_exists(PERSIST_KEY_TRIGGER_STREAK)
+                          ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
+        if (dbg_hr > 0) {
+            snprintf(debug_buf, sizeof(debug_buf),
+                     "HR:%d avg:%d d:%d x%d",
+                     (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak);
+        } else {
+            snprintf(debug_buf, sizeof(debug_buf), "HR: warming up...");
+        }
+        text_layer_set_text(s_debug_label, debug_buf);
+    } else {
+        text_layer_set_text(s_debug_label, "");
+    }
 }
 
 // ─── Tick handler (kept as stub in case minute updates needed later) ─────────
@@ -430,6 +454,16 @@ static void main_window_load(Window *window) {
         fonts_get_system_font(FONT_KEY_GOTHIC_14));
     layer_add_child(root, text_layer_get_layer(s_days_label));
 
+    // ── Debug telemetry line (subtle, between days and hint bar) ──
+    // Positioned 38px from bottom: 18px hint + 2px gap + 18px debug
+    s_debug_label = text_layer_create(GRect(4, h - 38, w - 8, 18));
+    text_layer_set_background_color(s_debug_label, GColorClear);
+    text_layer_set_text_color(s_debug_label, GColorDarkGray);
+    text_layer_set_text_alignment(s_debug_label, GTextAlignmentCenter);
+    text_layer_set_font(s_debug_label,
+        fonts_get_system_font(FONT_KEY_GOTHIC_14));
+    layer_add_child(root, text_layer_get_layer(s_debug_label));
+
     // ── Hint bar (bottom) ──
     s_hint_label = text_layer_create(GRect(0, h - 18, w, 18));
     text_layer_set_background_color(s_hint_label, GColorDarkGray);
@@ -476,6 +510,7 @@ static void main_window_unload(Window *window) {
     text_layer_destroy(s_detail_label);
     text_layer_destroy(s_days_label);
     text_layer_destroy(s_hint_label);
+    text_layer_destroy(s_debug_label);
     text_layer_destroy(s_up_label);
     text_layer_destroy(s_sel_label);
     text_layer_destroy(s_dn_label);

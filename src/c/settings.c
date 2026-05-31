@@ -35,6 +35,7 @@ typedef enum {
     ROW_START_HOUR,
     ROW_END_HOUR,
     ROW_VIBE_STRENGTH,
+    ROW_SENSITIVITY,
     ROW_COUNT
 } SettingsRow;
 
@@ -43,7 +44,8 @@ static const char * const ROW_LABELS[ROW_COUNT] = {
     "Active days",
     "No-nap from",
     "No-nap until",
-    "Wake vibration"
+    "Wake vibration",
+    "Detection"
 };
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
@@ -73,6 +75,7 @@ static bool s_enabled;
 static int  s_start_hour;
 static int  s_end_hour;
 static int  s_vibe_strength;
+static int  s_sensitivity;
 
 static int  s_selected_row  = 0;
 static int  s_scroll_offset = 0;
@@ -105,6 +108,12 @@ static void prv_format_value(int row, char *buf, size_t len) {
         case ROW_VIBE_STRENGTH:
             snprintf(buf, len, "%s", VIBE_STRENGTH_LABELS[s_vibe_strength]);
             break;
+        case ROW_SENSITIVITY: {
+            const char *sens_labels[] = { "Sensitive", "Balanced", "Conservative" };
+            int idx = (s_sensitivity >= 0 && s_sensitivity <= 2) ? s_sensitivity : 1;
+            snprintf(buf, len, "%s", sens_labels[idx]);
+            break;
+        }
         default:
             buf[0] = '\0';
             break;
@@ -123,6 +132,7 @@ static void prv_commit(void) {
     persist_write_int(PERSIST_KEY_START_HOUR,    s_start_hour);
     persist_write_int(PERSIST_KEY_END_HOUR,      s_end_hour);
     persist_write_int(PERSIST_KEY_VIBE_STRENGTH, s_vibe_strength);
+    persist_write_int(PERSIST_KEY_SENSITIVITY,   s_sensitivity);
     // PERSIST_KEY_ACTIVE_DAYS written by days_window.c directly
 
     AppWorkerMessage msg = { .data0 = APP_MSG_SETTINGS_CHANGED };
@@ -239,6 +249,9 @@ static void prv_adjust_value(int row, int delta) {
             vibes_enqueue_custom_pattern(pat);
             break;
         }
+        case ROW_SENSITIVITY:
+            s_sensitivity = wrap_int(s_sensitivity + delta, 2);
+            break;
         default: break;
     }
 }
@@ -292,6 +305,7 @@ static void prv_window_load(Window *window) {
     s_start_hour    = settings_get_start_hour();
     s_end_hour      = settings_get_end_hour();
     s_vibe_strength = settings_get_vibe_strength();
+    s_sensitivity   = settings_get_sensitivity();
     s_selected_row  = 0;
     s_scroll_offset = 0;
     s_editing       = false;
