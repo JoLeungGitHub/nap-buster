@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v1.1.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v1.5.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -13,14 +13,20 @@ NapBuster runs a **background worker** with two-tier sleep detection:
 ```
 Background worker (always running)
     │
-    ├─ TIER 1: Piggybacks on OS heart rate events (Pebble Time 2 / Pebble 2)
-    │       OS takes HR sample → HealthEventHeartRateUpdate fires for free
-    │           └──▶ read HR + accel, run analysis immediately
-    │       5-min fallback timer (only fires if no HR event arrived recently)
-    │           └──▶ peek HR ourselves (handles slow/off background sampling)
-    │       Two consecutive detections of HR drop + stillness? ──▶ alarm (~10–15 min)
+    ├─ TIER 1: Early warning — HR + VMC (Pebble Time 2 / Pebble 2 only)
     │
-    ├─ TIER 2: Pebble HealthService sleep confirmation (all platforms, fallback)
+    │   OS fires HealthEventHeartRateUpdate (free — no extra battery)
+    │       └──▶ read current HR BPM
+    │            read HealthMinuteData.vmc (pre-computed motion intensity)
+    │            run analysis:
+    │               HR dropped >N% below rolling average?  (N = sensitivity setting)
+    │               VMC below 100? (very still — not just sitting at desk)
+    │               Both true twice in a row? ──▶ alarm (~10–20 min after nap onset)
+    │
+    │   5-min fallback timer (only fires if no HR event arrived recently)
+    │       └──▶ same analysis, using HR peek (handles slow/off background sampling)
+    │
+    ├─ TIER 2: Fallback — Pebble HealthService sleep confirmation (all platforms)
     │       OS confirms sleep ──▶ alarm (45–90 min latency, but reliable)
     │
     └─ Alarm fires ──▶ launch foreground app
@@ -31,35 +37,54 @@ Background worker (always running)
                            └─ DOWN   ──▶ snooze 30 min
 ```
 
-**Battery efficient:** Tier 1 piggybacks on HR samples the OS was already taking — no extra CPU wakes. The 5-min fallback timer almost never does real work on the default 10-min sampling setting. All sensors are idle outside your guard window.
+### Why HR is the primary signal
+
+Heart rate is the most reliable indicator of sleep onset. As you fall asleep, your autonomic nervous system shifts from sympathetic to parasympathetic dominance — HR drops, HRV increases. This is a genuine physiological event specific to sleep or deep relaxation approaching it.
+
+**VMC (Vector Magnitude Count)** is a noise filter, not the primary signal. Its job: even if HR dips, you were clearly moving, so it wasn't sleep. Things like sitting down after a walk or post-lunch digestion can temporarily drop HR — VMC rules these out.
+
+### Rolling HR baseline
+
+NapBuster maintains a rolling 8-sample HR buffer (≈40–80 min of history depending on OS sampling rate). Triggers are compared against this rolling average, not a fixed baseline, so the threshold self-adjusts to your actual resting HR throughout the day. The buffer stays warm outside the guard window so detection is immediate the moment your window opens.
+
+### VMC vs. raw accelerometer
+
+Previous versions used `accel_service_peek()` (single instantaneous accelerometer snapshot computed by hand). v1.5.0 uses `HealthMinuteData.vmc` — a per-minute aggregate of all accelerometer movement pre-computed by the OS health subsystem. VMC is the same motion signal used by Pebble Health internally and is:
+- **Zero extra battery** — computed by the OS regardless of NapBuster
+- **Much more stable** — a minute aggregate vs. a single noisy snapshot
+- **Properly calibrated** — 0–100 = very still, 100–500 = light movement, 500+ = active
+
+**Battery efficient:** Tier 1 piggybacks on HR samples the OS was already taking. All sensors idle outside your guard window.
 
 ---
 
 ## Version history
 
-To check which version you have installed: open NapBuster → long-press SELECT → the version is shown at the bottom of the settings screen. Or check the Pebble app under App Settings → About.
+To check your installed version: open NapBuster → long-press SELECT → version shown at the bottom of settings.
 
 | Version | What changed |
 |---|---|
-| **1.5.0** | Replace raw accel peek with `HealthMinuteData.vmc` (pre-computed, zero extra battery); handle `HealthEventSignificantUpdate`; add `health_service_metric_accessible()` guard before HR reads; debug display now shows `vmc:` |
-| **1.4.0** | Debug telemetry on GUARDING screen (`HR:68 avg:74 d:142 x1`); Detection sensitivity setting (Sensitive/Balanced/Conservative) |
-| **1.3.0** | Alarm screen has per-button labels (UP/SEL/DN) instead of cramped single hint; Tier 1 HR buffer now stays warm outside the guard window so detection can fire immediately at window open |
-| **1.2.0** | Tier 1 now piggybacks on OS HR events (zero extra battery); 5-min timer only fires if no HR event arrived recently (handles slow/disabled background sampling) |
-| **1.1.0** | Two-tier detection: HR+accel early warning on Time 2/Pebble 2; HealthService sleep event as fallback on all platforms |
+| **1.5.0** | Replace raw accel peek with `HealthMinuteData.vmc` (pre-computed OS motion signal, zero extra battery, more stable); handle `HealthEventSignificantUpdate`; add `health_service_metric_accessible()` guard before HR reads; debug display shows `vmc:` |
+| **1.4.0** | Debug telemetry on GUARDING screen (`HR:68 avg:74 vmc:42 x1`); Detection sensitivity setting (Sensitive / Balanced / Conservative) |
+| **1.3.0** | Alarm screen per-button labels (UP/SEL/DN); HR buffer stays warm outside guard window for instant detection at window open |
+| **1.2.0** | Tier 1 piggybacks on OS HR events (zero extra battery); 5-min timer skips if HR event arrived recently |
+| **1.1.0** | Two-tier detection: HR+motion early warning on Time 2/Pebble 2; HealthService sleep event fallback on all platforms |
 | 1.0.0 | Initial release — HealthService sleep event detection only |
 
 ---
 
 ## Features
 
-- 🔬 **Early nap detection** — piggybacks on OS HR events + accel to catch nap onset in ~10–15 min (Pebble Time 2 / Pebble 2)
+- 🔬 **Early nap detection** — HR + VMC catches nap onset in ~10–20 min (Pebble Time 2 / Pebble 2)
 - 🛡️ **Fallback detection** — Pebble's native sleep confirmation as a safety net on all platforms
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed
 - 💤 **Snooze** — 10 or 30 minutes, re-arms automatically via Wakeup API (survives app close)
 - 📅 **Per-day schedule** — pick exactly which days to guard
 - 🕐 **Configurable no-nap hours** — set your own start and end time
 - 💪 **Vibration strength** — Gentle / Medium / Strong
-- 🔋 **Battery efficient** — Tier 1 rides free on HR samples the OS was already taking; sensors fully idle outside guard window
+- 🎛️ **Detection sensitivity** — tune the HR drop threshold to your physiology
+- 📊 **Live debug telemetry** — GUARDING screen shows real-time HR, avg, VMC, streak count
+- 🔋 **Battery efficient** — VMC is free from the OS; Tier 1 rides on HR samples already being taken
 
 ---
 
@@ -74,7 +99,15 @@ Open settings from the main screen with a **long-press on SELECT**.
 | **No-nap from** | Start of the no-nap window | 11:00 |
 | **No-nap until** | End of the no-nap window | 23:00 |
 | **Wake vibration** | Alarm intensity | Medium |
-| **Detection** | HR drop sensitivity (Sensitive=8% / Balanced=13% / Conservative=20%) | Balanced |
+| **Detection** | HR drop sensitivity — how large a drop triggers | Balanced |
+
+### Detection sensitivity
+
+| Level | HR drop required | Use when |
+|---|---|---|
+| **Sensitive** | 8% below rolling average | Missing naps (not triggering enough) |
+| **Balanced** | 13% below rolling average | Default — works for most people |
+| **Conservative** | 20% below rolling average | Too many false positives |
 
 ### Active days picker
 
@@ -98,6 +131,27 @@ The settings row shows a smart summary: `Every day`, `Weekdays`, `Weekends`, or 
 
 ---
 
+## Debug telemetry
+
+When in GUARDING state, the home screen shows a live readout:
+
+```
+HR:68 avg:74 vmc:42 x1
+```
+
+| Field | Meaning |
+|---|---|
+| `HR:` | Current heart rate BPM |
+| `avg:` | Your rolling average over recent readings |
+| `vmc:` | Vector Magnitude Count — motion intensity this minute (0–100 = still, 500+ = active) |
+| `x1` | Consecutive trigger streak (alarm fires at x2 or higher) |
+
+**Tuning guide:**
+- If it false-triggers: check `vmc:` when it fires. If VMC is high, you were moving — VMC threshold may need raising. If VMC is low with a small HR drop, try **Conservative** sensitivity or raise `STREAK_TO_FIRE`.
+- If it misses naps: check `vmc:` and `HR:` while drowsy. If HR isn't dropping much, try **Sensitive**. If VMC is high during naps (restless sleeper), the VMC gate may be too aggressive.
+
+---
+
 ## Controls
 
 ### Main screen
@@ -118,8 +172,8 @@ The settings row shows a smart summary: `Every day`, `Weekdays`, `Weekends`, or 
 
 | Platform | Watch | Detection |
 |---|---|---|
-| **emery** | Pebble Time 2 *(primary target)* | Tier 1 (HR+accel) + Tier 2 fallback |
-| **diorite** | Pebble 2 | Tier 1 (HR+accel) + Tier 2 fallback |
+| **emery** | Pebble Time 2 *(primary target)* | Tier 1 (HR + VMC) + Tier 2 fallback |
+| **diorite** | Pebble 2 | Tier 1 (HR + VMC) + Tier 2 fallback |
 | **basalt** | Pebble Time, Pebble Time Steel | Tier 2 only (no HR sensor) |
 | **chalk** | Pebble Time Round | Tier 2 only (no HR sensor) |
 
@@ -173,47 +227,57 @@ nap-buster/
 ├── package.json              # App config, version, capabilities, target platforms
 ├── wscript                   # Waf build script
 ├── src/c/
-│   ├── main.c                # Foreground app — alarm UI, snooze, launch handling
-│   ├── settings.c            # Settings screen — 5 rows with virtual scroll
+│   ├── main.c                # Foreground app — home screen, alarm UI, snooze
+│   ├── settings.c            # Settings screen — 6 rows with virtual scroll
 │   ├── settings.h
 │   ├── days_window.c         # Day picker sub-screen (per-day schedule)
 │   ├── days_window.h
 │   └── common.h              # Shared constants, persist keys, vibe patterns, helpers
 └── worker_src/c/
-    └── worker.c              # Background worker — two-tier sleep detection
+    └── worker.c              # Background worker v4 — two-tier sleep detection
 ```
 
 ### Key design decisions
 
-**Two-tier detection** — Tier 1 piggybacks on `HealthEventHeartRateUpdate` (zero extra battery — the OS was already waking the CPU for the HR sample). Analysis runs immediately on each event: HR is compared against a rolling 8-sample average, accel magnitude is checked against an EMA baseline. A 5-min fallback timer only peeks HR itself when no OS event arrived recently, covering users with slow or disabled background HR sampling. Tier 2 (HealthService sleep confirmation) runs alongside as a belt-and-suspenders fallback. HR capability is detected at runtime — no `#ifdef` needed.
+**HR is the primary signal, VMC is the gate.** HR drop is a genuine physiological marker of sleep onset. VMC only rules out cases where HR happened to dip while the user was clearly moving. The algorithm requires both: HR drops AND movement is low, sustained across 2 consecutive HR events.
 
-**Rolling HR buffer** — 8 samples of history (≈40–80 min depending on OS sampling rate). Compared against a rolling average rather than a fixed baseline, so the threshold self-adjusts to your actual resting HR throughout the day.
+**`HealthMinuteData.vmc` over raw accelerometer.** VMC is pre-computed by the OS health subsystem — no extra sensor power, no manual `√(x²+y²+z²)` computation, a full-minute aggregate rather than a single noisy instantaneous sample.
 
-**`common.h` is the single source of truth** for all persist keys, default values, vibration patterns, and the `is_in_no_nap_window()` helper.
+**Rolling HR baseline** — 8 samples of recent history (≈40–80 min depending on OS sampling rate). Self-adjusts to your actual resting HR; no fixed baseline that goes stale.
 
-**Snooze survives app close** via `wakeup_schedule()`. The OS wakes the app at the right time even if it was killed.
+**Piggybacking on OS HR events** — `HealthEventHeartRateUpdate` fires when the OS takes a HR reading anyway. Tier 1 analysis is free; the 5-min fallback timer only peeks HR when the OS hasn't done so recently (slow/off background sampling).
 
-**Active days** are stored as a bitmask (`uint8_t`): bit 0 = Sunday, bit 6 = Saturday. Preset values: `0x7F` = every day, `0x3E` = weekdays, `0x41` = weekends.
+**HR buffer always warm** — sampling continues outside the guard window on HR-capable platforms. `prv_try_launch_foreground()` guards against out-of-window firing, so collecting data outside is safe.
+
+**`common.h` is the single source of truth** for all persist keys, default values, vibration patterns, and `is_in_no_nap_window()`. Worker has its own copies of keys it needs (can't include `common.h`).
+
+**Snooze survives app close** via `wakeup_schedule()`. The OS re-launches the app at the right time.
+
+**Active days** stored as a bitmask (`uint8_t`): bit 0 = Sunday, bit 6 = Saturday. `0x7F` = every day, `0x3E` = weekdays, `0x41` = weekends.
 
 ---
 
 ## Persist key reference
 
-| Key | Value | Notes |
-|---|---|---|
-| `0` | `ENABLED` | bool — master on/off |
-| `1` | `START_HOUR` | int 0–23 |
-| `2` | `END_HOUR` | int 0–23 |
-| `3` | `SNOOZE_UNTIL` | time_t epoch, 0 = none |
-| `4` | `ALARMING` | bool — alarm currently active |
-| `5` | `WAKEUP_ID_SNOOZE` | WakeupId for snooze re-arm |
-| `7` | `VIBE_STRENGTH` | 0=Gentle 1=Medium 2=Strong |
-| `8` | `ACTIVE_DAYS` | uint8 bitmask (bit0=Sun..bit6=Sat) |
-| `10` | `HR_BUFFER` | int16_t[8] blob — rolling HR circular buffer |
-| `11` | `HR_BUF_IDX` | uint8 — write index into HR buffer |
-| `12` | `HR_BUF_COUNT` | uint8 — number of valid HR readings (0–8) |
-| `13` | `TRIGGER_STREAK` | uint8 — consecutive Tier 1 trigger count |
-| `14` | `ACCEL_AVG` | int32 — EMA of accelerometer magnitude (milli-g) |
+| Key | Name | Type | Notes |
+|---|---|---|---|
+| `0` | `ENABLED` | bool | Master on/off |
+| `1` | `START_HOUR` | int 0–23 | Guard window start |
+| `2` | `END_HOUR` | int 0–23 | Guard window end |
+| `3` | `SNOOZE_UNTIL` | time_t | Snooze expiry epoch (0 = none) |
+| `4` | `ALARMING` | bool | Alarm currently active |
+| `5` | `WAKEUP_ID_SNOOZE` | WakeupId | Scheduled snooze wakeup |
+| `7` | `VIBE_STRENGTH` | int | 0=Gentle 1=Medium 2=Strong |
+| `8` | `ACTIVE_DAYS` | uint8 bitmask | bit0=Sun..bit6=Sat |
+| `10` | `HR_BUFFER` | int16_t[8] blob | Rolling HR circular buffer |
+| `11` | `HR_BUF_IDX` | uint8 | Write index into HR buffer |
+| `12` | `HR_BUF_COUNT` | uint8 | Number of valid HR readings (0–8) |
+| `13` | `TRIGGER_STREAK` | uint8 | Consecutive Tier 1 trigger count |
+| `14` | `VMC_EMA` | uint32 | EMA of VMC (Vector Magnitude Count) |
+| `15` | `DEBUG_HR` | int16 | Last HR BPM seen by worker |
+| `16` | `DEBUG_AVG` | int16 | Last rolling HR average |
+| `17` | `DEBUG_ACCEL` | int32 | Last VMC reading |
+| `18` | `SENSITIVITY` | int | 0=Sensitive 1=Balanced 2=Conservative |
 
 ---
 
@@ -221,19 +285,19 @@ nap-buster/
 
 | Component | RAM used | Budget |
 |---|---|---|
-| Background worker | ~4.9 KB | 10.5 KB |
-| Foreground app | ~5.1 KB | 128 KB |
+| Background worker | ~4.5 KB | 10.5 KB |
+| Foreground app | ~10.7 KB | 128 KB |
 
 ---
 
-## A note on detection latency
+## Detection latency
 
 | Platform | Method | Typical latency |
 |---|---|---|
-| Pebble Time 2 / Pebble 2 | HR + accelerometer (Tier 1) | ~10–15 min after nap onset |
+| Pebble Time 2 / Pebble 2 | HR + VMC (Tier 1) | ~10–20 min after nap onset |
 | All platforms | HealthService sleep event (Tier 2) | 45–90 min (OS confirmed) |
 
-Tier 1 fires as soon as two consecutive 5-minute samples show HR dropping and movement stopping — typically right as you're settling into sleep, not after a full sleep cycle.
+Tier 1 requires 2 consecutive HR events showing a drop, so latency depends on the OS HR sampling interval (~10 min default). At 10-min sampling: earliest trigger is ~20 min; at faster sampling (exercise mode) it can be faster.
 
 ---
 

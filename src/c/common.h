@@ -22,7 +22,7 @@
 #define PERSIST_KEY_TRIGGER_STREAK   13  // uint8: Tier-1 consecutive trigger count
 #define PERSIST_KEY_DEBUG_HR         15  // int16: last sampled HR BPM
 #define PERSIST_KEY_DEBUG_AVG        16  // int16: rolling HR average
-#define PERSIST_KEY_DEBUG_ACCEL      17  // int32: last accel deviation from EMA
+#define PERSIST_KEY_DEBUG_ACCEL      17  // int32: last VMC reading (Vector Magnitude Count)
 #define PERSIST_KEY_SENSITIVITY      18  // int: 0=Sensitive 1=Balanced 2=Conservative
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
