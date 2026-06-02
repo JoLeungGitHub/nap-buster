@@ -1,17 +1,17 @@
 /**
- * worker.c — NapBuster Background Worker v3
+ * worker.c — NapBuster Background Worker v4
  *
  * Two-tier sleep detection:
  *
  *   TIER 1 (HR-capable platforms: emery/diorite)
  *   ─────────────────────────────────────────────
  *   Piggybacks on HealthEventHeartRateUpdate (free — OS was already waking for HR):
- *     • On every HR event: read HR + accel, run analysis immediately
+ *     • On every HR event: read HR + VMC, run analysis immediately
  *     • 5-min fallback timer: only runs analysis if no HR event arrived recently
  *       (handles users with slow/disabled background HR sampling setting)
  *     • Maintain 8-sample rolling HR circular buffer (persisted)
- *     • Update accel EMA
- *     • If HR drops >13% below rolling avg AND accel is still for ≥2 consecutive
+ *     • Update VMC EMA (Vector Magnitude Count — pre-computed motion intensity)
+ *     • If HR drops >13% below rolling avg AND VMC is still for ≥2 consecutive
  *       detections → fire alarm ~10-15 min into a nap (much earlier than native)
  *
  *   TIER 2 (ALL platforms including HR-capable)
@@ -31,8 +31,9 @@
  *   - worker_launch_app() returns void
  *   - WakeupId / wakeup_schedule() NOT available in worker context
  *   - HealthActivitySleep (NOT HealthActivityMaskSleep) is the correct enum
- *   - accel_service_peek() returns 0 on success, non-zero on failure
+ *   - health_service_get_minute_history() provides VMC + HR without extra sensor power
  *   - health_service_peek_current_value returns HealthValue (int32_t)
+ *   - health_service_metric_accessible() guards against unavailable HR data
  */
 
 #include <pebble_worker.h>
@@ -52,12 +53,12 @@
 #define PERSIST_KEY_HR_BUF_IDX        11  // uint8_t write index
 #define PERSIST_KEY_HR_BUF_COUNT      12  // uint8_t valid count (max HR_BUF_SIZE)
 #define PERSIST_KEY_TRIGGER_STREAK    13  // uint8_t consecutive trigger count
-#define PERSIST_KEY_ACCEL_AVG         14  // int32_t EMA of accel magnitude
+#define PERSIST_KEY_VMC_EMA           14  // uint32_t EMA of VMC (Vector Magnitude Count)
 
 // Tier-1 debug telemetry (written each analysis cycle, read by foreground app)
 #define PERSIST_KEY_DEBUG_HR          15  // int16: last sampled HR BPM
 #define PERSIST_KEY_DEBUG_AVG         16  // int16: rolling HR average
-#define PERSIST_KEY_DEBUG_ACCEL       17  // int32: last accel deviation from EMA
+#define PERSIST_KEY_DEBUG_ACCEL       17  // int32: last VMC reading
 
 // Detection sensitivity (shared with foreground app)
 #define PERSIST_KEY_SENSITIVITY       18  // int: 0=Sensitive 1=Balanced 2=Conservative
@@ -82,8 +83,8 @@
 
 #define HR_BUF_SIZE          8       // ~40 min history at 5-min intervals
 #define HR_DROP_PCT          87      // trigger if hr*100 < rolling_avg * HR_DROP_PCT
-#define ACCEL_STILL_THRESH   200     // milli-g deviation from EMA = "still"
-#define ACCEL_EMA_ALPHA      8       // EMA weight: new = (old*(ALPHA-1) + new) / ALPHA
+#define VMC_STILL_THRESH     100     // VMC below this = "very still" (~0-100=still, 500+=active)
+#define VMC_EMA_ALPHA        4       // EMA weight: faster than old accel EMA (VMC is per-minute)
 #define STREAK_TO_FIRE       2       // consecutive detections before alarm
 #define SAMPLE_INTERVAL_MS   300000  // 5 minutes in ms (fallback timer)
 #define SAMPLE_INTERVAL_SECS 300     // same in seconds (for recency check)
@@ -114,25 +115,12 @@ static uint8_t  s_hr_buf_count = 0;   // number of valid entries (0..HR_BUF_SIZE
 // Tier-1 consecutive detection streak
 static uint8_t  s_trigger_streak = 0;
 
-// Tier-1 accel EMA (milli-g)
-static int32_t  s_accel_avg    = 0;
+// Tier-1 VMC EMA (Vector Magnitude Count — pre-computed motion from HealthMinuteData)
+static uint32_t s_vmc_ema       = 0;
 
 // Timestamp of last HealthEventHeartRateUpdate (0 = never)
 // Used by the fallback timer to avoid duplicate analysis
 static time_t   s_last_hr_event_time = 0;
-
-// ─── Integer sqrt (Newton's method — no math.h needed) ───────────────────────
-
-static int32_t prv_isqrt(int64_t sq) {
-    if (sq <= 0) return 0;
-    int64_t r = sq / 2 + 1;
-    for (int i = 0; i < 10; i++) {
-        int64_t r2 = (r + sq / r) / 2;
-        if (r2 >= r) break;
-        r = r2;
-    }
-    return (int32_t)r;
-}
 
 // ─── Setting Helpers ──────────────────────────────────────────────────────────
 
@@ -206,7 +194,7 @@ static void prv_save_hr_state(void) {
     persist_write_int(PERSIST_KEY_HR_BUF_IDX,      s_hr_buf_idx);
     persist_write_int(PERSIST_KEY_HR_BUF_COUNT,    s_hr_buf_count);
     persist_write_int(PERSIST_KEY_TRIGGER_STREAK,  s_trigger_streak);
-    persist_write_int(PERSIST_KEY_ACCEL_AVG,       s_accel_avg);
+    persist_write_int(PERSIST_KEY_VMC_EMA,         (int)s_vmc_ema);
 }
 
 static void prv_load_hr_state(void) {
@@ -220,8 +208,8 @@ static void prv_load_hr_state(void) {
                         ? (uint8_t)persist_read_int(PERSIST_KEY_HR_BUF_COUNT)   : 0;
     s_trigger_streak  = persist_exists(PERSIST_KEY_TRIGGER_STREAK)
                         ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
-    s_accel_avg       = persist_exists(PERSIST_KEY_ACCEL_AVG)
-                        ? (int32_t)persist_read_int(PERSIST_KEY_ACCEL_AVG)      : 0;
+    s_vmc_ema         = persist_exists(PERSIST_KEY_VMC_EMA)
+                        ? (uint32_t)persist_read_int(PERSIST_KEY_VMC_EMA)       : 0;
 }
 
 static void prv_reset_hr_state(void) __attribute__((unused));
@@ -230,8 +218,21 @@ static void prv_reset_hr_state(void) {
     s_hr_buf_idx     = 0;
     s_hr_buf_count   = 0;
     s_trigger_streak = 0;
-    s_accel_avg      = 0;
+    s_vmc_ema        = 0;
     APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: HR state reset (fresh baseline)");
+}
+
+// ─── HR Accessibility Guard ───────────────────────────────────────────────────
+
+/**
+ * Returns true if the HR metric has valid data available for the past minute.
+ * Use before every health_service_peek_current_value(HealthMetricHeartRateBPM).
+ */
+static bool prv_hr_accessible(void) {
+    time_t now = time(NULL);
+    HealthServiceAccessibilityMask mask =
+        health_service_metric_accessible(HealthMetricHeartRateBPM, now - 60, now);
+    return (mask & HealthServiceAccessibilityMaskAvailable) != 0;
 }
 
 // ─── HealthService Subscribe / Unsubscribe ───────────────────────────────────
@@ -283,39 +284,55 @@ static void prv_try_launch_foreground(void) {
 
 /**
  * Core Tier-1 analysis: called with a fresh HR reading (or 0 if unavailable).
- * Samples accel, updates rolling buffers, evaluates trigger conditions.
+ * Reads VMC from HealthMinuteData, updates rolling buffers, evaluates trigger
+ * conditions.
  * hr_val: current BPM from either HealthEventHeartRateUpdate or a fresh peek.
  */
 static void prv_run_tier1_analysis(int16_t hr_val) {
-    // ── 1. Sample accelerometer ───────────────────────────────────────────────
-    AccelData accel = {0};
-    int32_t current_mag = 0;
-    if (accel_service_peek(&accel) == 0) {
-        int64_t sq = (int64_t)accel.x * accel.x
-                   + (int64_t)accel.y * accel.y
-                   + (int64_t)accel.z * accel.z;
-        current_mag = prv_isqrt(sq);
+    // ── 1. Get VMC from HealthMinuteData (last 2 minutes) ────────────────────────
+    // VMC (Vector Magnitude Count) is a pre-computed motion intensity from the
+    // health subsystem — free, no extra sensor power, better calibrated than
+    // raw accel_service_peek().
+    uint32_t current_vmc = 0;
+    HealthMinuteData minute_data[2];
+    time_t end_time = time(NULL);
+    time_t start_time = end_time - (2 * SECONDS_PER_MINUTE);
+    uint32_t num_records = health_service_get_minute_history(
+        minute_data, 2, &start_time, &end_time);
+    if (num_records > 0) {
+        // Use the most recent valid record's VMC
+        for (int i = (int)num_records - 1; i >= 0; i--) {
+            if (!minute_data[i].is_invalid) {
+                current_vmc = minute_data[i].vmc;
+                break;
+            }
+        }
+        APP_LOG(APP_LOG_LEVEL_DEBUG,
+            "NapBuster Tier1: VMC=%u (from %u records)", (unsigned)current_vmc, (unsigned)num_records);
     } else {
-        APP_LOG(APP_LOG_LEVEL_WARNING, "NapBuster worker: accel_service_peek failed");
-        current_mag = s_accel_avg;  // use EMA — don't false-trigger "still"
+        // No minute history available — use EMA as safe fallback (not "still")
+        current_vmc = s_vmc_ema > 0 ? s_vmc_ema : VMC_STILL_THRESH + 1;
+        APP_LOG(APP_LOG_LEVEL_DEBUG, "NapBuster Tier1: no minute history, VMC fallback");
     }
 
-    // ── 2. Update accel EMA ───────────────────────────────────────────────────
-    if (s_accel_avg == 0) {
-        s_accel_avg = current_mag;  // seed on first reading
+    // ── 2. Update VMC EMA ─────────────────────────────────────────────────────────
+    if (s_vmc_ema == 0) {
+        s_vmc_ema = current_vmc;  // seed on first reading
     } else {
-        s_accel_avg = (s_accel_avg * (ACCEL_EMA_ALPHA - 1) + current_mag)
-                      / ACCEL_EMA_ALPHA;
+        s_vmc_ema = (s_vmc_ema * (VMC_EMA_ALPHA - 1) + current_vmc) / VMC_EMA_ALPHA;
     }
 
-    // ── 3. Update HR circular buffer ─────────────────────────────────────────
+    // ── 3. Stillness check using VMC ──────────────────────────────────────────────
+    bool still = (current_vmc < VMC_STILL_THRESH);
+
+    // ── 4. Update HR circular buffer ─────────────────────────────────────────
     if (hr_val > 0) {
         s_hr_buf[s_hr_buf_idx] = hr_val;
         s_hr_buf_idx = (s_hr_buf_idx + 1) % HR_BUF_SIZE;
         if (s_hr_buf_count < HR_BUF_SIZE) s_hr_buf_count++;
     }
 
-    // ── 4. Compute rolling HR average and check drop ──────────────────────────
+    // ── 5. Compute rolling HR average and check drop ──────────────────────────
     bool hr_drop = false;
     int32_t rolling_avg = 0;
     if (hr_val > 0 && s_hr_buf_count >= 3) {
@@ -333,13 +350,9 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
             (int)hr_val, (int)s_hr_buf_count);
     }
 
-    // ── 5. Stillness check ────────────────────────────────────────────────────
-    int32_t accel_dev = current_mag - s_accel_avg;
-    if (accel_dev < 0) accel_dev = -accel_dev;
-    bool still = (accel_dev < ACCEL_STILL_THRESH);
     APP_LOG(APP_LOG_LEVEL_DEBUG,
-        "NapBuster Tier1: mag=%d ema=%d dev=%d still=%d",
-        (int)current_mag, (int)s_accel_avg, (int)accel_dev, (int)still);
+        "NapBuster Tier1: vmc=%u ema=%u still=%d",
+        (unsigned)current_vmc, (unsigned)s_vmc_ema, (int)still);
 
     // ── 6. Update trigger streak ──────────────────────────────────────────────
     if (hr_drop && still) {
@@ -359,16 +372,17 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
     // ── 7. Fire if streak threshold reached ───────────────────────────────────
     if (s_trigger_streak >= STREAK_TO_FIRE) {
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster Tier1: sleep detected — HR+accel threshold reached");
+            "NapBuster Tier1: sleep detected — HR+VMC threshold reached");
         s_trigger_streak = 0;  // reset so post-snooze doze-off can re-trigger
         prv_try_launch_foreground();
     }
 
     // ── 8. Persist all Tier-1 state ───────────────────────────────────────────
-    // Write debug telemetry for the foreground display
+    // Write debug telemetry for the foreground display (PERSIST_KEY_DEBUG_ACCEL
+    // now stores the current VMC reading instead of accel deviation)
     persist_write_int(PERSIST_KEY_DEBUG_HR,    (int)hr_val);
     persist_write_int(PERSIST_KEY_DEBUG_AVG,   (int)rolling_avg);
-    persist_write_int(PERSIST_KEY_DEBUG_ACCEL, (int)accel_dev);
+    persist_write_int(PERSIST_KEY_DEBUG_ACCEL, (int)current_vmc);
     prv_save_hr_state();
 }
 
@@ -409,12 +423,16 @@ static void prv_sample_timer_callback(void *ctx) {
             "NapBuster Tier1 timer: HR event ran analysis %ds ago — skipping",
             (int)(now - s_last_hr_event_time));
     } else {
-        // No recent HR event — do our own peek
+        // No recent HR event — do our own peek (guarded by accessibility check)
         APP_LOG(APP_LOG_LEVEL_DEBUG,
             "NapBuster Tier1 timer: no recent HR event — peeking HR");
-        HealthValue hr_val =
-            health_service_peek_current_value(HealthMetricHeartRateBPM);
-        prv_run_tier1_analysis((hr_val > 0) ? (int16_t)hr_val : 0);
+        int16_t hr_val = 0;
+        if (prv_hr_accessible()) {
+            HealthValue peeked =
+                health_service_peek_current_value(HealthMetricHeartRateBPM);
+            hr_val = (peeked > 0) ? (int16_t)peeked : 0;
+        }
+        prv_run_tier1_analysis(hr_val);
     }
 
     prv_start_sample_timer();  // re-arm
@@ -484,14 +502,33 @@ static void prv_window_timer_callback(void *ctx) {
 // ─── HealthService Callback (Tier 1 fast path + Tier 2 fallback) ─────────────
 
 static void prv_health_event_handler(HealthEventType event, void *ctx) {
+    // ── HealthEventSignificantUpdate — re-read everything ────────────────────
+    if (event == HealthEventSignificantUpdate) {
+        // Re-check sleep state — significant updates can include sleep transitions
+        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: HealthEventSignificantUpdate — re-checking sleep");
+        HealthActivityMask activities = health_service_peek_current_activities();
+        bool is_sleeping = (activities & HealthActivitySleep) ||
+                           (activities & HealthActivityRestfulSleep);
+        if (is_sleeping) {
+            prv_try_launch_foreground();
+        } else {
+            s_launch_pending = false;
+        }
+        return;
+    }
+
     if (event == HealthEventHeartRateUpdate && s_hr_capable) {
         // ── Tier 1 fast path — piggyback on OS HR sample (zero extra battery) ──
-        HealthValue hr_val =
-            health_service_peek_current_value(HealthMetricHeartRateBPM);
+        int16_t hr_val = 0;
+        if (prv_hr_accessible()) {
+            HealthValue peeked =
+                health_service_peek_current_value(HealthMetricHeartRateBPM);
+            hr_val = (peeked > 0) ? (int16_t)peeked : 0;
+        }
         s_last_hr_event_time = time(NULL);
         APP_LOG(APP_LOG_LEVEL_DEBUG,
             "NapBuster Tier1: HR event — BPM=%d", (int)hr_val);
-        prv_run_tier1_analysis((hr_val > 0) ? (int16_t)hr_val : 0);
+        prv_run_tier1_analysis(hr_val);
         return;
     }
 
@@ -549,27 +586,25 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
 // ─── Worker Lifecycle ─────────────────────────────────────────────────────────
 
 static void worker_init(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v3: starting");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v4: starting");
 
     app_worker_message_subscribe(prv_app_message_handler);
 
     // ── Runtime HR capability detection ──────────────────────────────────────
-    // On HR-capable platforms (emery/diorite) this returns a positive BPM.
-    // On basalt/chalk it returns 0 or negative — graceful degradation to Tier 2.
-    HealthValue hr_probe =
-        health_service_peek_current_value(HealthMetricHeartRateBPM);
-    s_hr_capable = (hr_probe > 0);
+    // Use health_service_metric_accessible() for a proper capability check.
+    // On basalt/chalk (no HR sensor) this returns 0 → graceful degradation to Tier 2.
+    s_hr_capable = prv_hr_accessible();
 
     APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker v2: HR capable=%d (probe=%d)",
-        (int)s_hr_capable, (int)hr_probe);
+        "NapBuster worker v4: HR capable=%d",
+        (int)s_hr_capable);
 
     if (s_hr_capable) {
         prv_load_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v2: loaded HR state idx=%d count=%d streak=%d accel_avg=%d",
+            "NapBuster worker v4: loaded HR state idx=%d count=%d streak=%d vmc_ema=%u",
             (int)s_hr_buf_idx, (int)s_hr_buf_count,
-            (int)s_trigger_streak, (int)s_accel_avg);
+            (int)s_trigger_streak, (unsigned)s_vmc_ema);
     }
 
     bool in_window = prv_get_enabled() && prv_is_in_window();
@@ -583,7 +618,7 @@ static void worker_init(void) {
         prv_subscribe_health();
         prv_start_sample_timer();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v3: HR-capable — sampling always-on for warm baseline");
+            "NapBuster worker v4: HR-capable — sampling always-on for warm baseline");
     }
 
     if (in_window) {
@@ -599,12 +634,12 @@ static void worker_init(void) {
         HealthActivityMask acts = health_service_peek_current_activities();
         if ((acts & HealthActivitySleep) || (acts & HealthActivityRestfulSleep)) {
             APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster worker v2: sleep already active on init");
+                "NapBuster worker v4: sleep already active on init");
             prv_try_launch_foreground();
         }
     } else {
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v2: outside window on start — HealthService idle");
+            "NapBuster worker v4: outside window on start — HealthService idle");
     }
 
     // Always start the 60s boundary check timer
@@ -612,7 +647,7 @@ static void worker_init(void) {
 }
 
 static void worker_deinit(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v3: stopping");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v4: stopping");
 
     prv_stop_sample_timer();
     prv_stop_window_timer();
@@ -623,7 +658,7 @@ static void worker_deinit(void) {
     if (s_hr_capable) {
         prv_save_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v2: saved HR state idx=%d count=%d streak=%d",
+            "NapBuster worker v4: saved HR state idx=%d count=%d streak=%d",
             (int)s_hr_buf_idx, (int)s_hr_buf_count, (int)s_trigger_streak);
     }
 }

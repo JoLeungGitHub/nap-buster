@@ -41,6 +41,7 @@ To check which version you have installed: open NapBuster → long-press SELECT 
 
 | Version | What changed |
 |---|---|
+| **1.5.0** | Replace raw accel peek with `HealthMinuteData.vmc` (pre-computed, zero extra battery); handle `HealthEventSignificantUpdate`; add `health_service_metric_accessible()` guard before HR reads; debug display now shows `vmc:` |
 | **1.4.0** | Debug telemetry on GUARDING screen (`HR:68 avg:74 d:142 x1`); Detection sensitivity setting (Sensitive/Balanced/Conservative) |
 | **1.3.0** | Alarm screen has per-button labels (UP/SEL/DN) instead of cramped single hint; Tier 1 HR buffer now stays warm outside the guard window so detection can fire immediately at window open |
 | **1.2.0** | Tier 1 now piggybacks on OS HR events (zero extra battery); 5-min timer only fires if no HR event arrived recently (handles slow/disabled background sampling) |
