@@ -341,7 +341,7 @@ static void update_home_screen(void) {
                           ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
         if (dbg_hr > 0) {
             snprintf(debug_buf, sizeof(debug_buf),
-                     "HR:%d avg:%d vmc:%d x%d",
+                     "HR:%d base:%d vmc:%d x%d",
                      (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak);
         } else {
             snprintf(debug_buf, sizeof(debug_buf), "HR: warming up...");

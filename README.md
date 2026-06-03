@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v1.5.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v1.6.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -19,7 +19,7 @@ Background worker (always running)
     │       └──▶ read current HR BPM
     │            read HealthMinuteData.vmc (pre-computed motion intensity)
     │            run analysis:
-    │               HR dropped >N% below rolling average?  (N = sensitivity setting)
+    │               smoothed HR dropped >N% below anchored awake baseline? (N = sensitivity)
     │               VMC below 100? (very still — not just sitting at desk)
     │               Both true twice in a row? ──▶ alarm (~10–20 min after nap onset)
     │
@@ -43,9 +43,18 @@ Heart rate is the most reliable indicator of sleep onset. As you fall asleep, yo
 
 **VMC (Vector Magnitude Count)** is a noise filter, not the primary signal. Its job: even if HR dips, you were clearly moving, so it wasn't sleep. Things like sitting down after a walk or post-lunch digestion can temporarily drop HR — VMC rules these out.
 
-### Rolling HR baseline
+### Anchored awake HR baseline
 
-NapBuster maintains a rolling 8-sample HR buffer (≈40–80 min of history depending on OS sampling rate). Triggers are compared against this rolling average, not a fixed baseline, so the threshold self-adjusts to your actual resting HR throughout the day. The buffer stays warm outside the guard window so detection is immediate the moment your window opens.
+NapBuster maintains an **anchored awake baseline** — your HR when you're awake and resting. Unlike a rolling average that blindly tracks all readings (including ones taken while dozing off), the anchored baseline only updates when you're demonstrably awake and moving at a resting pace.
+
+The baseline update rule uses a **dual-bound VMC gate**:
+- **VMC < 50** — too still (possibly already asleep/dozing) → baseline **frozen**
+- **50 ≤ VMC < 400** — resting awake zone (desk work, light activity) → baseline updates via EMA
+- **VMC ≥ 400** — exercising → baseline **frozen** (prevents post-run HR from inflating threshold)
+
+This means a nap trigger compares against your *actual awake resting HR*, not an average that may have drifted downward during a slow doze. The α=7/8 EMA moves gradually, so brief stillness won't instantly lower the baseline.
+
+A 3-sample smoothing buffer on the current HR reading reduces single-sample noise before the comparison is made.
 
 ### VMC vs. raw accelerometer
 
@@ -64,6 +73,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **1.6.0** | Anchored awake HR baseline replaces rolling average — baseline only updates in resting-awake VMC zone (50–400), frozen during sleep onset or exercise; 3-sample HR smoothing buffer; debug display shows `base:` instead of `avg:` |
 | **1.5.0** | Replace raw accel peek with `HealthMinuteData.vmc` (pre-computed OS motion signal, zero extra battery, more stable); handle `HealthEventSignificantUpdate`; add `health_service_metric_accessible()` guard before HR reads; debug display shows `vmc:` |
 | **1.4.0** | Debug telemetry on GUARDING screen (`HR:68 avg:74 vmc:42 x1`); Detection sensitivity setting (Sensitive / Balanced / Conservative) |
 | **1.3.0** | Alarm screen per-button labels (UP/SEL/DN); HR buffer stays warm outside guard window for instant detection at window open |
@@ -136,13 +146,13 @@ The settings row shows a smart summary: `Every day`, `Weekdays`, `Weekends`, or 
 When in GUARDING state, the home screen shows a live readout:
 
 ```
-HR:68 avg:74 vmc:42 x1
+HR:68 base:74 vmc:42 x1
 ```
 
 | Field | Meaning |
 |---|---|
-| `HR:` | Current heart rate BPM |
-| `avg:` | Your rolling average over recent readings |
+| `HR:` | Current heart rate BPM (3-sample smoothed) |
+| `base:` | Your anchored awake baseline HR |
 | `vmc:` | Vector Magnitude Count — motion intensity this minute (0–100 = still, 500+ = active) |
 | `x1` | Consecutive trigger streak (alarm fires at x2 or higher) |
 
@@ -234,7 +244,7 @@ nap-buster/
 │   ├── days_window.h
 │   └── common.h              # Shared constants, persist keys, vibe patterns, helpers
 └── worker_src/c/
-    └── worker.c              # Background worker v4 — two-tier sleep detection
+    └── worker.c              # Background worker v5 — anchored baseline + two-tier sleep detection
 ```
 
 ### Key design decisions
@@ -243,7 +253,7 @@ nap-buster/
 
 **`HealthMinuteData.vmc` over raw accelerometer.** VMC is pre-computed by the OS health subsystem — no extra sensor power, no manual `√(x²+y²+z²)` computation, a full-minute aggregate rather than a single noisy instantaneous sample.
 
-**Rolling HR baseline** — 8 samples of recent history (≈40–80 min depending on OS sampling rate). Self-adjusts to your actual resting HR; no fixed baseline that goes stale.
+**Anchored awake HR baseline, not a rolling average.** A rolling average chases HR downward during a gradual nap onset and never crosses the threshold — this was the core failure mode. The anchored baseline only updates in the resting-awake VMC zone (50–400): frozen during exercise (avoids baseline inflating to 110 bpm after a run) and frozen during stillness (avoids drifting down with sleep onset). A 3-sample smoothing buffer on the current HR reduces single-reading noise before the comparison.
 
 **Piggybacking on OS HR events** — `HealthEventHeartRateUpdate` fires when the OS takes a HR reading anyway. Tier 1 analysis is free; the 5-min fallback timer only peeks HR when the OS hasn't done so recently (slow/off background sampling).
 
@@ -278,6 +288,7 @@ nap-buster/
 | `16` | `DEBUG_AVG` | int16 | Last rolling HR average |
 | `17` | `DEBUG_ACCEL` | int32 | Last VMC reading |
 | `18` | `SENSITIVITY` | int | 0=Sensitive 1=Balanced 2=Conservative |
+| `19` | `HR_AWAKE_BASELINE` | int16 | Anchored awake HR baseline (updated only in resting VMC zone) |
 
 ---
 

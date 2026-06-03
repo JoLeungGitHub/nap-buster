@@ -1,5 +1,5 @@
 /**
- * worker.c — NapBuster Background Worker v4
+ * worker.c — NapBuster Background Worker v5
  *
  * Two-tier sleep detection:
  *
@@ -9,10 +9,11 @@
  *     • On every HR event: read HR + VMC, run analysis immediately
  *     • 5-min fallback timer: only runs analysis if no HR event arrived recently
  *       (handles users with slow/disabled background HR sampling setting)
- *     • Maintain 8-sample rolling HR circular buffer (persisted)
- *     • Update VMC EMA (Vector Magnitude Count — pre-computed motion intensity)
- *     • If HR drops >13% below rolling avg AND VMC is still for ≥2 consecutive
- *       detections → fire alarm ~10-15 min into a nap (much earlier than native)
+ *     • Maintain anchored awake HR baseline (only updates upward when moving)
+ *     • 3-sample smoothing buffer for current HR (noise reduction)
+ *     • If smoothed HR drops below awake baseline by threshold AND VMC still
+ *       for ≥2 consecutive detections → alarm. Baseline never drifts down
+ *       with sleep onset — fixes gradual-drop detection failure.
  *
  *   TIER 2 (ALL platforms including HR-capable)
  *   ─────────────────────────────────────────────
@@ -64,6 +65,8 @@
 #define PERSIST_KEY_SENSITIVITY       18  // int: 0=Sensitive 1=Balanced 2=Conservative
 #define DEFAULT_SENSITIVITY           1   // Balanced
 
+#define PERSIST_KEY_HR_BASELINE      19  // int16: anchored awake HR baseline
+
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
 #define DEFAULT_ENABLED                1
@@ -81,9 +84,11 @@
 
 // ─── Tier-1 Constants ─────────────────────────────────────────────────────────
 
-#define HR_BUF_SIZE          8       // ~40 min history at 5-min intervals
+#define HR_BUF_SIZE          3       // short smoothing buffer (3 readings ~= 30min at 10-min sampling)
 #define HR_DROP_PCT          87      // trigger if hr*100 < rolling_avg * HR_DROP_PCT
-#define VMC_STILL_THRESH     100     // VMC below this = "very still" (~0-100=still, 500+=active)
+#define VMC_STILL_THRESH     100     // VMC below this = too still — possible sleep, freeze baseline
+#define VMC_BASELINE_MIN     50      // VMC must be above this to update baseline (not asleep/dozing)
+#define VMC_BASELINE_MAX     400     // VMC must be below this to update baseline (not exercising)
 #define VMC_EMA_ALPHA        4       // EMA weight: faster than old accel EMA (VMC is per-minute)
 #define STREAK_TO_FIRE       2       // consecutive detections before alarm
 #define SAMPLE_INTERVAL_MS   300000  // 5 minutes in ms (fallback timer)
@@ -117,6 +122,10 @@ static uint8_t  s_trigger_streak = 0;
 
 // Tier-1 VMC EMA (Vector Magnitude Count — pre-computed motion from HealthMinuteData)
 static uint32_t s_vmc_ema       = 0;
+
+// Anchored awake HR baseline — only updates upward when VMC is high (clearly moving).
+// Never drifts down as user falls asleep. This is the stable reference for hr_drop.
+static int16_t  s_hr_awake_baseline = 0;  // 0 = not yet established
 
 // Timestamp of last HealthEventHeartRateUpdate (0 = never)
 // Used by the fallback timer to avoid duplicate analysis
@@ -195,6 +204,7 @@ static void prv_save_hr_state(void) {
     persist_write_int(PERSIST_KEY_HR_BUF_COUNT,    s_hr_buf_count);
     persist_write_int(PERSIST_KEY_TRIGGER_STREAK,  s_trigger_streak);
     persist_write_int(PERSIST_KEY_VMC_EMA,         (int)s_vmc_ema);
+    persist_write_int(PERSIST_KEY_HR_BASELINE,     (int)s_hr_awake_baseline);
 }
 
 static void prv_load_hr_state(void) {
@@ -210,6 +220,8 @@ static void prv_load_hr_state(void) {
                         ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
     s_vmc_ema         = persist_exists(PERSIST_KEY_VMC_EMA)
                         ? (uint32_t)persist_read_int(PERSIST_KEY_VMC_EMA)       : 0;
+    s_hr_awake_baseline = persist_exists(PERSIST_KEY_HR_BASELINE)
+                          ? (int16_t)persist_read_int(PERSIST_KEY_HR_BASELINE) : 0;
 }
 
 static void prv_reset_hr_state(void) __attribute__((unused));
@@ -219,6 +231,7 @@ static void prv_reset_hr_state(void) {
     s_hr_buf_count   = 0;
     s_trigger_streak = 0;
     s_vmc_ema        = 0;
+    s_hr_awake_baseline = 0;
     APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: HR state reset (fresh baseline)");
 }
 
@@ -325,29 +338,64 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
     // ── 3. Stillness check using VMC ──────────────────────────────────────────────
     bool still = (current_vmc < VMC_STILL_THRESH);
 
-    // ── 4. Update HR circular buffer ─────────────────────────────────────────
+    // ── 4. Update HR smoothing buffer (last 3 readings) ──────────────────────
+    // This is for smoothing current HR only — NOT used as the baseline.
+    int16_t smoothed_hr = hr_val;
     if (hr_val > 0) {
         s_hr_buf[s_hr_buf_idx] = hr_val;
         s_hr_buf_idx = (s_hr_buf_idx + 1) % HR_BUF_SIZE;
         if (s_hr_buf_count < HR_BUF_SIZE) s_hr_buf_count++;
-    }
 
-    // ── 5. Compute rolling HR average and check drop ──────────────────────────
-    bool hr_drop = false;
-    int32_t rolling_avg = 0;
-    if (hr_val > 0 && s_hr_buf_count >= 3) {
+        // Compute smoothed HR from buffer
         int32_t sum = 0;
         for (uint8_t i = 0; i < s_hr_buf_count; i++) sum += s_hr_buf[i];
-        rolling_avg = sum / s_hr_buf_count;
-        int drop_pct = prv_get_hr_drop_pct();
-        hr_drop = ((int32_t)hr_val * 100) < (rolling_avg * drop_pct);
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: HR=%d avg=%d hr_drop=%d",
-            (int)hr_val, (int)rolling_avg, (int)hr_drop);
-    } else {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: HR=%d buf_count=%d (need >=3)",
-            (int)hr_val, (int)s_hr_buf_count);
+        smoothed_hr = (int16_t)(sum / s_hr_buf_count);
+    }
+
+    // ── 5. Update anchored awake baseline ────────────────────────────────────
+    // Baseline is only established/updated when VMC is high (clearly moving/awake).
+    // It never drifts downward — if HR drops (sleep onset), baseline stays put.
+    // This prevents the "chasing" problem where rolling avg tracks sleep HR down.
+    bool hr_drop = false;
+    int32_t baseline_for_display = (int32_t)s_hr_awake_baseline;
+
+    if (hr_val > 0) {
+        if (s_hr_awake_baseline == 0) {
+            // Not yet established — seed from first valid reading.
+            // If this happens during exercise it'll correct itself quickly once
+            // the resting zone is entered (VMC_BASELINE_MIN..VMC_BASELINE_MAX).
+            s_hr_awake_baseline = smoothed_hr;
+            APP_LOG(APP_LOG_LEVEL_INFO,
+                "NapBuster Tier1: awake baseline seeded at %d BPM", (int)s_hr_awake_baseline);
+        } else if (current_vmc >= VMC_BASELINE_MIN && current_vmc < VMC_BASELINE_MAX) {
+            // VMC is in the "normal awake" zone — not asleep (< MIN) and not
+            // exercising (>= MAX). Track HR freely with a gentle EMA so the
+            // baseline converges to true resting awake HR over time.
+            // Update in both directions so it isn't permanently stuck from an
+            // early high/low seed — just moves slowly enough not to chase sleep onset.
+            s_hr_awake_baseline = (int16_t)((s_hr_awake_baseline * 7 + smoothed_hr) / 8);
+            APP_LOG(APP_LOG_LEVEL_DEBUG,
+                "NapBuster Tier1: baseline tracking -> %d (vmc=%u in resting zone)",
+                (int)s_hr_awake_baseline, (unsigned)current_vmc);
+        } else {
+            APP_LOG(APP_LOG_LEVEL_DEBUG,
+                "NapBuster Tier1: baseline frozen (vmc=%u — %s)",
+                (unsigned)current_vmc,
+                current_vmc < VMC_BASELINE_MIN ? "too still/asleep" : "exercising");
+        }
+
+        // Check drop against ANCHORED baseline (not rolling average)
+        if (s_hr_awake_baseline > 0 && s_hr_buf_count >= 2) {
+            int drop_pct = prv_get_hr_drop_pct();
+            hr_drop = ((int32_t)smoothed_hr * 100) < ((int32_t)s_hr_awake_baseline * drop_pct);
+            APP_LOG(APP_LOG_LEVEL_DEBUG,
+                "NapBuster Tier1: smoothed_hr=%d baseline=%d drop_pct=%d hr_drop=%d",
+                (int)smoothed_hr, (int)s_hr_awake_baseline, drop_pct, (int)hr_drop);
+        } else {
+            APP_LOG(APP_LOG_LEVEL_DEBUG,
+                "NapBuster Tier1: HR=%d baseline=%d buf_count=%d (need baseline+2 readings)",
+                (int)hr_val, (int)s_hr_awake_baseline, (int)s_hr_buf_count);
+        }
     }
 
     APP_LOG(APP_LOG_LEVEL_DEBUG,
@@ -380,8 +428,8 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
     // ── 8. Persist all Tier-1 state ───────────────────────────────────────────
     // Write debug telemetry for the foreground display (PERSIST_KEY_DEBUG_ACCEL
     // now stores the current VMC reading instead of accel deviation)
-    persist_write_int(PERSIST_KEY_DEBUG_HR,    (int)hr_val);
-    persist_write_int(PERSIST_KEY_DEBUG_AVG,   (int)rolling_avg);
+    persist_write_int(PERSIST_KEY_DEBUG_HR,    (int)smoothed_hr);
+    persist_write_int(PERSIST_KEY_DEBUG_AVG,   (int)baseline_for_display);
     persist_write_int(PERSIST_KEY_DEBUG_ACCEL, (int)current_vmc);
     prv_save_hr_state();
 }
@@ -586,7 +634,7 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
 // ─── Worker Lifecycle ─────────────────────────────────────────────────────────
 
 static void worker_init(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v4: starting");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v5: starting");
 
     app_worker_message_subscribe(prv_app_message_handler);
 
@@ -596,13 +644,13 @@ static void worker_init(void) {
     s_hr_capable = prv_hr_accessible();
 
     APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker v4: HR capable=%d",
+        "NapBuster worker v5: HR capable=%d",
         (int)s_hr_capable);
 
     if (s_hr_capable) {
         prv_load_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v4: loaded HR state idx=%d count=%d streak=%d vmc_ema=%u",
+            "NapBuster worker v5: loaded HR state idx=%d count=%d streak=%d vmc_ema=%u",
             (int)s_hr_buf_idx, (int)s_hr_buf_count,
             (int)s_trigger_streak, (unsigned)s_vmc_ema);
     }
@@ -618,7 +666,7 @@ static void worker_init(void) {
         prv_subscribe_health();
         prv_start_sample_timer();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v4: HR-capable — sampling always-on for warm baseline");
+            "NapBuster worker v5: HR-capable — sampling always-on for warm baseline");
     }
 
     if (in_window) {
@@ -634,12 +682,12 @@ static void worker_init(void) {
         HealthActivityMask acts = health_service_peek_current_activities();
         if ((acts & HealthActivitySleep) || (acts & HealthActivityRestfulSleep)) {
             APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster worker v4: sleep already active on init");
+                "NapBuster worker v5: sleep already active on init");
             prv_try_launch_foreground();
         }
     } else {
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v4: outside window on start — HealthService idle");
+            "NapBuster worker v5: outside window on start — HealthService idle");
     }
 
     // Always start the 60s boundary check timer
@@ -647,7 +695,7 @@ static void worker_init(void) {
 }
 
 static void worker_deinit(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v4: stopping");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v5: stopping");
 
     prv_stop_sample_timer();
     prv_stop_window_timer();
@@ -658,7 +706,7 @@ static void worker_deinit(void) {
     if (s_hr_capable) {
         prv_save_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v4: saved HR state idx=%d count=%d streak=%d",
+            "NapBuster worker v5: saved HR state idx=%d count=%d streak=%d",
             (int)s_hr_buf_idx, (int)s_hr_buf_count, (int)s_trigger_streak);
     }
 }
