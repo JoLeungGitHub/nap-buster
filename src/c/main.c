@@ -355,7 +355,13 @@ static void update_home_screen(void) {
 // ─── Tick handler (kept as stub in case minute updates needed later) ─────────
 
 static void worker_message_handler(uint16_t type, AppWorkerMessage *msg) {
-    if (type == WORKER_MSG_SLEEP_DETECTED) start_alarm();
+    if (type == WORKER_MSG_SLEEP_DETECTED) {
+        start_alarm();
+    } else if (type == WORKER_MSG_NAP_NUDGE) {
+        // App was already open — just do the nudge pulse, no alarm
+        persist_delete(PERSIST_KEY_NUDGE_PENDING);
+        vibes_double_pulse();
+    }
 }
 
 // ─── Click handlers ──────────────────────────────────────────────────────────
@@ -559,9 +565,16 @@ static void app_init(void) {
         }
     }
 
-    // Worker launch → sleep detected
+    // Worker launch → sleep detected OR nudge
     if (launch_reason() == APP_LAUNCH_WORKER) {
-        start_alarm();
+        if (persist_exists(PERSIST_KEY_NUDGE_PENDING) &&
+                persist_read_int(PERSIST_KEY_NUDGE_PENDING)) {
+            // Nudge mode: double pulse, show home screen, no alarm
+            persist_delete(PERSIST_KEY_NUDGE_PENDING);
+            vibes_double_pulse();
+        } else {
+            start_alarm();
+        }
         return;
     }
 

@@ -66,6 +66,7 @@
 #define DEFAULT_SENSITIVITY           1   // Balanced
 
 #define PERSIST_KEY_HR_BASELINE      19  // int16: anchored awake HR baseline
+#define PERSIST_KEY_NUDGE_PENDING    20  // bool: worker set nudge, foreground should pulse+clear
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -77,6 +78,7 @@
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
 #define WORKER_MSG_SLEEP_DETECTED      0
+#define WORKER_MSG_NAP_NUDGE           1  // x1 streak: gentle nudge request
 #define APP_MSG_SNOOZE_10              10
 #define APP_MSG_SNOOZE_30              11
 #define APP_MSG_DISMISS                12
@@ -406,8 +408,23 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
     if (hr_drop && still) {
         s_trigger_streak++;
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster Tier1: trigger streak=%d (need %d)",
+            "NapBuster Tier1: trigger streak=%d (need %d for full alarm)",
             (int)s_trigger_streak, STREAK_TO_FIRE);
+
+        // x1: gentle nudge — launch foreground in nudge mode (double pulse, no alarm).
+        // If this alone breaks the nap, great. If not, x2 fires the full alarm.
+        if (s_trigger_streak == 1
+                && prv_get_enabled()
+                && prv_is_in_window()
+                && !prv_is_snoozed()
+                && !prv_is_already_alarming()) {
+            persist_write_int(PERSIST_KEY_NUDGE_PENDING, 1);
+            worker_launch_app();
+            // Also message the foreground if it's already running
+            AppWorkerMessage nudge_msg = { .data0 = WORKER_MSG_NAP_NUDGE };
+            app_worker_send_message(WORKER_MSG_NAP_NUDGE, &nudge_msg);
+            APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster Tier1: nudge launched at streak=1");
+        }
     } else {
         if (s_trigger_streak > 0) {
             APP_LOG(APP_LOG_LEVEL_DEBUG,
@@ -417,10 +434,10 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
         s_trigger_streak = 0;
     }
 
-    // ── 7. Fire if streak threshold reached ───────────────────────────────────
+    // ── 7. Fire full alarm if streak threshold reached ────────────────────────
     if (s_trigger_streak >= STREAK_TO_FIRE) {
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster Tier1: sleep detected — HR+VMC threshold reached");
+            "NapBuster Tier1: sleep detected — full alarm firing");
         s_trigger_streak = 0;  // reset so post-snooze doze-off can re-trigger
         prv_try_launch_foreground();
     }

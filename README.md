@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v1.6.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v1.7.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -21,7 +21,8 @@ Background worker (always running)
     │            run analysis:
     │               smoothed HR dropped >N% below anchored awake baseline? (N = sensitivity)
     │               VMC below 100? (very still — not just sitting at desk)
-    │               Both true twice in a row? ──▶ alarm (~10–20 min after nap onset)
+    │               Both true twice in a row? ──▶ double-pulse nudge (~10 min after nap onset)
+    │               Nudge ignored and still dropping? ──▶ full alarm (~20 min)
     │
     │   5-min fallback timer (only fires if no HR event arrived recently)
     │       └──▶ same analysis, using HR peek (handles slow/off background sampling)
@@ -73,6 +74,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **1.7.0** | Two-stage wake: x1 streak fires a quiet double-pulse nudge; x2 streak fires the full repeating alarm |
 | **1.6.0** | Anchored awake HR baseline replaces rolling average — baseline only updates in resting-awake VMC zone (50–400), frozen during sleep onset or exercise; 3-sample HR smoothing buffer; debug display shows `base:` instead of `avg:` |
 | **1.5.0** | Replace raw accel peek with `HealthMinuteData.vmc` (pre-computed OS motion signal, zero extra battery, more stable); handle `HealthEventSignificantUpdate`; add `health_service_metric_accessible()` guard before HR reads; debug display shows `vmc:` |
 | **1.4.0** | Debug telemetry on GUARDING screen (`HR:68 avg:74 vmc:42 x1`); Detection sensitivity setting (Sensitive / Balanced / Conservative) |
@@ -85,7 +87,8 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 ## Features
 
-- 🔬 **Early nap detection** — HR + VMC catches nap onset in ~10–20 min (Pebble Time 2 / Pebble 2)
+- 🔬 **Early nap detection** — HR + VMC catches nap onset in ~10 min (Pebble Time 2 / Pebble 2)
+- 🔔 **Two-stage wake** — quiet double-pulse nudge at x1 streak; full repeating alarm only if you don't stir
 - 🛡️ **Fallback detection** — Pebble's native sleep confirmation as a safety net on all platforms
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed
 - 💤 **Snooze** — 10 or 30 minutes, re-arms automatically via Wakeup API (survives app close)
@@ -303,12 +306,12 @@ nap-buster/
 
 ## Detection latency
 
-| Platform | Method | Typical latency |
-|---|---|---|
-| Pebble Time 2 / Pebble 2 | HR + VMC (Tier 1) | ~10–20 min after nap onset |
-| All platforms | HealthService sleep event (Tier 2) | 45–90 min (OS confirmed) |
+| Platform | Method | Nudge latency | Full alarm latency |
+|---|---|---|---|
+| Pebble Time 2 / Pebble 2 | HR + VMC (Tier 1) | ~10 min after nap onset | ~20 min (if nudge ignored) |
+| All platforms | HealthService sleep event (Tier 2) | — | 45–90 min (OS confirmed) |
 
-Tier 1 requires 2 consecutive HR events showing a drop, so latency depends on the OS HR sampling interval (~10 min default). At 10-min sampling: earliest trigger is ~20 min; at faster sampling (exercise mode) it can be faster.
+Tier 1 requires 2 consecutive HR events showing a drop, so latency depends on the OS HR sampling interval (~10 min default). The nudge fires on the 1st hit; the full alarm fires on the 2nd.
 
 ---
 

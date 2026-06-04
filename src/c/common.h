@@ -24,6 +24,8 @@
 #define PERSIST_KEY_DEBUG_AVG        16  // int16: rolling HR average
 #define PERSIST_KEY_DEBUG_ACCEL      17  // int32: last VMC reading (Vector Magnitude Count)
 #define PERSIST_KEY_SENSITIVITY      18  // int: 0=Sensitive 1=Balanced 2=Conservative
+#define PERSIST_KEY_HR_BASELINE      19  // int16: anchored awake HR baseline
+#define PERSIST_KEY_NUDGE_PENDING    20  // bool: worker requests a nudge pulse from foreground
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
@@ -35,6 +37,7 @@
 
 // ─── Worker / App Message Keys ────────────────────────────────────────────────
 #define WORKER_MSG_SLEEP_DETECTED    0
+#define WORKER_MSG_NAP_NUDGE         1  // x1 streak: gentle nudge (no full alarm)
 #define APP_MSG_SNOOZE_10            10
 #define APP_MSG_SNOOZE_30            11
 #define APP_MSG_DISMISS              12
