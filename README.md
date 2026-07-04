@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v1.8.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v2.0.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -15,8 +15,8 @@ Background worker (always running)
     │
     ├─ TIER 1: Early warning — HR + VMC (Pebble Time 2 / Pebble 2 only)
     │
-    │   Inside the guard window the worker requests a 60-second HR sample
-    │   period, so HealthEventHeartRateUpdate arrives ~once a minute
+    │   Inside the guard window the worker requests a 120-second HR sample
+    │   period, so HealthEventHeartRateUpdate arrives ~once every 2 minutes
     │   (outside the window it rides the OS's own ~10-min samples for free)
     │       └──▶ read current HR BPM
     │            read HealthMinuteData.vmc (pre-computed motion intensity)
@@ -60,7 +60,7 @@ The update rule is **asymmetric** (v1.8.0):
 
 The baseline is only **seeded** when VMC ≥ 50 (never from a reading taken while you might already be dozing) and clamped to a sane 40–120 BPM range. The α=7/8 EMA moves gradually, so brief conditions won't yank it around.
 
-A 3-sample smoothing buffer on the current HR reading reduces single-sample noise before the comparison is made. At the boosted 60-second cadence that's a ~3-minute smoothing horizon.
+A 3-sample smoothing buffer on the current HR reading reduces single-sample noise before the comparison is made. At the boosted 120-second cadence that's a ~6-minute smoothing horizon.
 
 ### VMC vs. raw accelerometer
 
@@ -69,7 +69,7 @@ Previous versions used `accel_service_peek()` (single instantaneous acceleromete
 - **Much more stable** — a minute aggregate vs. a single noisy snapshot
 - **Properly calibrated** — 0–100 = very still, 100–500 = light movement, 500+ = active
 
-**Battery:** outside the guard window Tier 1 piggybacks on HR samples the OS was already taking (zero extra cost). *Inside* the window the worker requests a 60-second HR sample period — this is NapBuster's one real battery spend, and it's what makes minute-level detection possible. The boost is cancelled the moment the window closes, on settings changes that close it, and on worker shutdown.
+**Battery:** outside the guard window Tier 1 piggybacks on HR samples the OS was already taking (zero extra cost). *Inside* the window the worker requests a 120-second HR sample period — this is NapBuster's one real battery spend, and it's what makes near-minute-level detection possible. The boost is cancelled the moment the window closes, on settings changes that close it, and on worker shutdown.
 
 ---
 
@@ -79,6 +79,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **2.0.0** | Cadence tuned to 2-minute HR sampling (was 60 s) — halves the in-window battery spend from v1.8.0 while keeping detection latency effectively unchanged, since the two-stage wake thresholds are time-based, not sample-count-based. Detection overhaul carried over from v1.8.0: worker owns the HR cadence (`health_service_set_heart_rate_sample_period`); missing HR/VMC data now freezes the streak instead of resetting it (stale `peek` returns 0 — this was silently zeroing the streak mid-nap); two-stage wake is time-based (nudge ≥4 min sustained, alarm ≥10 min) instead of raw event counts; asymmetric baseline updates (up always unless exercising, down only with awake-zone movement) with guarded seeding and 40–120 clamp; dismiss now actually notifies the worker + 10-min re-fire cooldown; out-of-window HR subscription no longer torn down after 60 s (warm baseline for real); HR capability probe self-heals; nudge cooldown (10 min); debug line shows analysis age |
 | **1.8.0** | Detection overhaul — fixes "never fires" and "nudge spam": worker owns the HR cadence (60 s sample period inside the window via `health_service_set_heart_rate_sample_period`); missing HR/VMC data now freezes the streak instead of resetting it (stale `peek` returns 0 — this was silently zeroing the streak mid-nap); two-stage wake is time-based (nudge ≥4 min sustained, alarm ≥10 min) instead of raw event counts; asymmetric baseline updates (up always unless exercising, down only with awake-zone movement) with guarded seeding and 40–120 clamp; dismiss now actually notifies the worker + 10-min re-fire cooldown; out-of-window HR subscription no longer torn down after 60 s (warm baseline for real); HR capability probe self-heals; nudge cooldown (10 min); debug line shows analysis age |
 | **1.7.0** | Two-stage wake: x1 streak fires a quiet double-pulse nudge; x2 streak fires the full repeating alarm |
 | **1.6.0** | Anchored awake HR baseline replaces rolling average — baseline only updates in resting-awake VMC zone (50–400), frozen during sleep onset or exercise; 3-sample HR smoothing buffer; debug display shows `base:` instead of `avg:` |
@@ -93,7 +94,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 ## Features
 
-- 🔬 **Early nap detection** — HR + VMC at a 1-minute cadence catches nap onset in ~5–10 min (Pebble Time 2 / Pebble 2)
+- 🔬 **Early nap detection** — HR + VMC at a 2-minute cadence catches nap onset in ~5–10 min (Pebble Time 2 / Pebble 2)
 - 🔔 **Two-stage wake** — quiet double-pulse nudge after ~4 min of sustained evidence; full repeating alarm at ~10 min if you don't stir
 - 🛡️ **Fallback detection** — Pebble's native sleep confirmation as a safety net on all platforms
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed
@@ -166,7 +167,7 @@ HR:68 base:74 vmc:42 x1 2m
 | `x1` | Consecutive positive-cycle streak |
 | `2m` | Minutes since the worker last completed an analysis cycle |
 
-**The age field is the first thing to check.** While guarding it should read `0m`–`1m` (boosted 60 s cadence). If it keeps climbing, no analysis is running — HR data isn't reaching the worker (Pebble Health or HR disabled in the mobile app, or the watch rejected the sample-period request).
+**The age field is the first thing to check.** While guarding it should read `0m`–`2m` (boosted 120 s cadence). If it keeps climbing, no analysis is running — HR data isn't reaching the worker (Pebble Health or HR disabled in the mobile app, or the watch rejected the sample-period request).
 
 **Tuning guide:**
 - If it false-triggers: check `vmc:` when it fires. If VMC is high, you were moving — VMC threshold may need raising. If VMC is low with a small HR drop, try **Conservative** sensitivity or raise `ALARM_AFTER_SECS` in `worker.c`.
@@ -325,7 +326,7 @@ nap-buster/
 
 | Platform | Method | Nudge latency | Full alarm latency |
 |---|---|---|---|
-| Pebble Time 2 / Pebble 2 | HR + VMC, boosted 60 s cadence (Tier 1) | ~4–5 min sustained evidence | ~10–11 min (if nudge ignored) |
+| Pebble Time 2 / Pebble 2 | HR + VMC, boosted 120 s cadence (Tier 1) | ~4–6 min sustained evidence | ~10–12 min (if nudge ignored) |
 | Pebble Time 2 / Pebble 2 | HR + VMC, boost rejected by OS (Tier 1 degraded) | ~10–20 min | ~20–30 min |
 | All platforms | HealthService sleep event (Tier 2) | — | 45–90 min (OS confirmed; short naps may never classify) |
 

@@ -6,8 +6,8 @@
  *   TIER 1 (HR-capable platforms: emery/diorite)
  *   ─────────────────────────────────────────────
  *   Inside the guard window the worker OWNS the HR cadence: it requests a
- *   60-second heart-rate sample period (health_service_set_heart_rate_sample_period),
- *   so HealthEventHeartRateUpdate arrives ~once a minute instead of the OS
+ *   120-second heart-rate sample period (health_service_set_heart_rate_sample_period),
+ *   so HealthEventHeartRateUpdate arrives ~once every 2 minutes instead of the OS
  *   default of once every ~10 minutes (and even less often during long
  *   stillness — exactly when a nap is happening). Outside the window the
  *   boost is cancelled and Tier 1 rides free on the OS's own background
@@ -23,7 +23,11 @@
  *   Two-stage wake, time-based (cadence-independent):
  *     • nudge:      ≥2 positive cycles sustained ≥4 min  → double-pulse launch
  *     • full alarm: ≥3 positive cycles sustained ≥10 min → repeating alarm
- *   With 60 s samples that is ~4-5 min to nudge, ~10 min to alarm. If the OS
+ *   With the time-based thresholds this holds regardless of cadence: nudge
+ *   still fires once ~4 min of sustained evidence accumulates, alarm once
+ *   ~10 min does — 120 s samples just mean up to one extra cadence tick
+ *   (~2 min) of slop versus the 60 s cadence before crossing that mark. If
+ *   the OS
  *   rejects the boost (default 10-min cadence) it degrades to ~10 min nudge,
  *   ~20 min alarm — the same latency v1.7 promised but could not deliver.
  *
@@ -100,7 +104,7 @@
 
 // ─── Tier-1 Constants ─────────────────────────────────────────────────────────
 
-#define HR_BUF_SIZE           3       // smoothing buffer (~3 min at boosted 60s cadence)
+#define HR_BUF_SIZE           3       // smoothing buffer (~6 min at boosted 120s cadence)
 #define VMC_STILL_THRESH      100     // VMC below this = still enough to be asleep
 #define VMC_BASELINE_MIN      50      // VMC needed for a DOWNWARD baseline update / seed
 #define VMC_BASELINE_MAX      400     // VMC at/above this = exercising, baseline frozen
@@ -108,7 +112,7 @@
 #define VMC_LOOKBACK_MIN      10      // minutes of minute-history searched for a valid VMC
 #define BASELINE_MIN_BPM      40      // sanity clamp for the awake baseline
 #define BASELINE_MAX_BPM      120
-#define HR_BOOST_PERIOD_SECS  60      // in-window HR sample period request
+#define HR_BOOST_PERIOD_SECS  120     // in-window HR sample period request
 
 // Two-stage wake: counts AND sustained time both required (cadence-independent)
 #define NUDGE_MIN_COUNT       2
@@ -335,7 +339,7 @@ static void prv_unsubscribe_health(void) {
 /**
  * Request (or cancel) a boosted HR sample period. Only active inside the
  * guard window — this is the one part of NapBuster that spends real battery,
- * and it's what makes ~1-minute detection cadence possible.
+ * and it's what makes ~2-minute detection cadence possible.
  */
 static void prv_set_hr_boost(bool on) {
     if (!s_hr_capable) return;
@@ -345,7 +349,7 @@ static void prv_set_hr_boost(bool on) {
     s_hr_boosted = on && ok;
     APP_LOG(APP_LOG_LEVEL_INFO,
         "NapBuster worker: HR sample period %s (ok=%d)",
-        on ? "boosted to 60s" : "reset to default", (int)ok);
+        on ? "boosted to 120s" : "reset to default", (int)ok);
 }
 
 // ─── Launch Logic ─────────────────────────────────────────────────────────────
@@ -557,7 +561,7 @@ static void prv_stop_sample_timer(void) {
 /**
  * Fallback timer — fires every 5 minutes while the worker runs (HR platforms).
  * Skips entirely if a HealthEventHeartRateUpdate ran analysis recently, which
- * inside the window (boosted 60 s events) is essentially always. Outside the
+ * inside the window (boosted 120 s events) is essentially always. Outside the
  * window it keeps the awake baseline warm between sparse OS samples.
  * peek_current_value returns 0 for samples older than 15 min — a zero here
  * just skips the cycle, it no longer resets detection state.
@@ -613,7 +617,7 @@ static void prv_apply_window_state(void) {
         prv_stop_sample_timer();
     }
 
-    // Boosted 60 s HR sampling only while guarding
+    // Boosted 120 s HR sampling only while guarding
     prv_set_hr_boost(in_window);
 
     if (in_window && !was_active) {
