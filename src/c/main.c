@@ -147,6 +147,14 @@ static void stop_alarm(void) {
     persist_write_int(PERSIST_KEY_ALARMING, 0);
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
     cancel_existing_wakeup();
+
+    // Tell the worker the alarm was acknowledged: it resets its detection
+    // streak, and the persisted timestamp gives it a short re-fire cooldown
+    // (Tier 2's sleep classification stays stale for a while after waking).
+    persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
+    AppWorkerMessage msg = { .data0 = APP_MSG_DISMISS };
+    app_worker_send_message(APP_MSG_DISMISS, &msg);
+
     update_home_screen();
 }
 
@@ -329,7 +337,7 @@ static void update_home_screen(void) {
     layer_mark_dirty(s_state_bar);
 
     // ── Debug telemetry display (GUARDING state only) ──
-    static char debug_buf[32];
+    static char debug_buf[40];
     if (state == HOME_STATE_GUARDING) {
         int16_t dbg_hr  = persist_exists(PERSIST_KEY_DEBUG_HR)
                           ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_HR) : 0;
@@ -339,10 +347,26 @@ static void update_home_screen(void) {
                           ? persist_read_int(PERSIST_KEY_DEBUG_ACCEL) : 0;
         uint8_t streak  = persist_exists(PERSIST_KEY_TRIGGER_STREAK)
                           ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
+        int32_t last_ts = persist_exists(PERSIST_KEY_DEBUG_LAST_TS)
+                          ? persist_read_int(PERSIST_KEY_DEBUG_LAST_TS) : 0;
         if (dbg_hr > 0) {
-            snprintf(debug_buf, sizeof(debug_buf),
-                     "HR:%d base:%d vmc:%d x%d",
-                     (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak);
+            // Age of the last completed analysis — the quickest way to see on
+            // the watch whether detection is actually running.
+            int age_min = -1;
+            if (last_ts > 0) {
+                time_t now = time(NULL);
+                if (now >= (time_t)last_ts) age_min = (int)((now - last_ts) / 60);
+            }
+            if (age_min >= 0 && age_min < 100) {
+                snprintf(debug_buf, sizeof(debug_buf),
+                         "HR:%d base:%d vmc:%d x%d %dm",
+                         (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak,
+                         age_min);
+            } else {
+                snprintf(debug_buf, sizeof(debug_buf),
+                         "HR:%d base:%d vmc:%d x%d",
+                         (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak);
+            }
         } else {
             snprintf(debug_buf, sizeof(debug_buf), "HR: warming up...");
         }

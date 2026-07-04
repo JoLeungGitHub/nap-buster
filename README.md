@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v1.7.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v2.0.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -15,25 +15,29 @@ Background worker (always running)
     │
     ├─ TIER 1: Early warning — HR + VMC (Pebble Time 2 / Pebble 2 only)
     │
-    │   OS fires HealthEventHeartRateUpdate (free — no extra battery)
+    │   Inside the guard window the worker requests a 120-second HR sample
+    │   period, so HealthEventHeartRateUpdate arrives ~once every 2 minutes
+    │   (outside the window it rides the OS's own ~10-min samples for free)
     │       └──▶ read current HR BPM
     │            read HealthMinuteData.vmc (pre-computed motion intensity)
     │            run analysis:
     │               smoothed HR dropped >N% below anchored awake baseline? (N = sensitivity)
     │               VMC below 100? (very still — not just sitting at desk)
-    │               Both true twice in a row? ──▶ double-pulse nudge (~10 min after nap onset)
-    │               Nudge ignored and still dropping? ──▶ full alarm (~20 min)
+    │               Missing HR or VMC data? ──▶ cycle skipped, streak preserved
+    │               Sustained ≥4 min (≥2 cycles)  ──▶ double-pulse nudge
+    │               Sustained ≥10 min (≥3 cycles) ──▶ full alarm
     │
     │   5-min fallback timer (only fires if no HR event arrived recently)
-    │       └──▶ same analysis, using HR peek (handles slow/off background sampling)
+    │       └──▶ same analysis, using HR peek (handles boost-rejected sampling)
     │
     ├─ TIER 2: Fallback — Pebble HealthService sleep confirmation (all platforms)
-    │       OS confirms sleep ──▶ alarm (45–90 min latency, but reliable)
+    │       OS confirms sleep ──▶ alarm (45–90 min latency; short naps may
+    │       never be classified — this is a safety net, not the main path)
     │
     └─ Alarm fires ──▶ launch foreground app
                            │
                            ├─ Repeating vibration
-                           ├─ SELECT ──▶ dismiss
+                           ├─ SELECT ──▶ dismiss (10-min re-fire cooldown)
                            ├─ UP     ──▶ snooze 10 min
                            └─ DOWN   ──▶ snooze 30 min
 ```
@@ -46,16 +50,17 @@ Heart rate is the most reliable indicator of sleep onset. As you fall asleep, yo
 
 ### Anchored awake HR baseline
 
-NapBuster maintains an **anchored awake baseline** — your HR when you're awake and resting. Unlike a rolling average that blindly tracks all readings (including ones taken while dozing off), the anchored baseline only updates when you're demonstrably awake and moving at a resting pace.
+NapBuster maintains an **anchored awake baseline** — your HR when you're awake and resting. Unlike a rolling average that blindly tracks all readings (including ones taken while dozing off), the anchored baseline never follows your HR down into a nap.
 
-The baseline update rule uses a **dual-bound VMC gate**:
-- **VMC < 50** — too still (possibly already asleep/dozing) → baseline **frozen**
-- **50 ≤ VMC < 400** — resting awake zone (desk work, light activity) → baseline updates via EMA
-- **VMC ≥ 400** — exercising → baseline **frozen** (prevents post-run HR from inflating threshold)
+The update rule is **asymmetric** (v1.8.0):
+- **VMC ≥ 400** (exercising) → baseline **frozen** — a run must not inflate the anchor
+- **smoothed HR ≥ baseline** → baseline updates **upward** via EMA — an up-move can never be sleep-onset chasing, so it's always allowed; this un-sticks a baseline seeded too low
+- **smoothed HR < baseline AND VMC ≥ 50** → baseline updates **downward** via EMA — you're demonstrably awake and moving, so tracking your true resting HR down is safe
+- **smoothed HR < baseline AND VMC < 50** → baseline **frozen** — dropping HR while very still is exactly what a nap onset looks like
 
-This means a nap trigger compares against your *actual awake resting HR*, not an average that may have drifted downward during a slow doze. The α=7/8 EMA moves gradually, so brief stillness won't instantly lower the baseline.
+The baseline is only **seeded** when VMC ≥ 50 (never from a reading taken while you might already be dozing) and clamped to a sane 40–120 BPM range. The α=7/8 EMA moves gradually, so brief conditions won't yank it around.
 
-A 3-sample smoothing buffer on the current HR reading reduces single-sample noise before the comparison is made.
+A 3-sample smoothing buffer on the current HR reading reduces single-sample noise before the comparison is made. At the boosted 120-second cadence that's a ~6-minute smoothing horizon.
 
 ### VMC vs. raw accelerometer
 
@@ -64,7 +69,7 @@ Previous versions used `accel_service_peek()` (single instantaneous acceleromete
 - **Much more stable** — a minute aggregate vs. a single noisy snapshot
 - **Properly calibrated** — 0–100 = very still, 100–500 = light movement, 500+ = active
 
-**Battery efficient:** Tier 1 piggybacks on HR samples the OS was already taking. All sensors idle outside your guard window.
+**Battery:** outside the guard window Tier 1 piggybacks on HR samples the OS was already taking (zero extra cost). *Inside* the window the worker requests a 120-second HR sample period — this is NapBuster's one real battery spend, and it's what makes near-minute-level detection possible. The boost is cancelled the moment the window closes, on settings changes that close it, and on worker shutdown.
 
 ---
 
@@ -74,6 +79,8 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **2.0.0** | Cadence tuned to 2-minute HR sampling (was 60 s) — halves the in-window battery spend from v1.8.0 while keeping detection latency effectively unchanged, since the two-stage wake thresholds are time-based, not sample-count-based. Detection overhaul carried over from v1.8.0: worker owns the HR cadence (`health_service_set_heart_rate_sample_period`); missing HR/VMC data now freezes the streak instead of resetting it (stale `peek` returns 0 — this was silently zeroing the streak mid-nap); two-stage wake is time-based (nudge ≥4 min sustained, alarm ≥10 min) instead of raw event counts; asymmetric baseline updates (up always unless exercising, down only with awake-zone movement) with guarded seeding and 40–120 clamp; dismiss now actually notifies the worker + 10-min re-fire cooldown; out-of-window HR subscription no longer torn down after 60 s (warm baseline for real); HR capability probe self-heals; nudge cooldown (10 min); debug line shows analysis age |
+| **1.8.0** | Detection overhaul — fixes "never fires" and "nudge spam": worker owns the HR cadence (60 s sample period inside the window via `health_service_set_heart_rate_sample_period`); missing HR/VMC data now freezes the streak instead of resetting it (stale `peek` returns 0 — this was silently zeroing the streak mid-nap); two-stage wake is time-based (nudge ≥4 min sustained, alarm ≥10 min) instead of raw event counts; asymmetric baseline updates (up always unless exercising, down only with awake-zone movement) with guarded seeding and 40–120 clamp; dismiss now actually notifies the worker + 10-min re-fire cooldown; out-of-window HR subscription no longer torn down after 60 s (warm baseline for real); HR capability probe self-heals; nudge cooldown (10 min); debug line shows analysis age |
 | **1.7.0** | Two-stage wake: x1 streak fires a quiet double-pulse nudge; x2 streak fires the full repeating alarm |
 | **1.6.0** | Anchored awake HR baseline replaces rolling average — baseline only updates in resting-awake VMC zone (50–400), frozen during sleep onset or exercise; 3-sample HR smoothing buffer; debug display shows `base:` instead of `avg:` |
 | **1.5.0** | Replace raw accel peek with `HealthMinuteData.vmc` (pre-computed OS motion signal, zero extra battery, more stable); handle `HealthEventSignificantUpdate`; add `health_service_metric_accessible()` guard before HR reads; debug display shows `vmc:` |
@@ -87,8 +94,8 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 ## Features
 
-- 🔬 **Early nap detection** — HR + VMC catches nap onset in ~10 min (Pebble Time 2 / Pebble 2)
-- 🔔 **Two-stage wake** — quiet double-pulse nudge at x1 streak; full repeating alarm only if you don't stir
+- 🔬 **Early nap detection** — HR + VMC at a 2-minute cadence catches nap onset in ~5–10 min (Pebble Time 2 / Pebble 2)
+- 🔔 **Two-stage wake** — quiet double-pulse nudge after ~4 min of sustained evidence; full repeating alarm at ~10 min if you don't stir
 - 🛡️ **Fallback detection** — Pebble's native sleep confirmation as a safety net on all platforms
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed
 - 💤 **Snooze** — 10 or 30 minutes, re-arms automatically via Wakeup API (survives app close)
@@ -96,8 +103,8 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 - 🕐 **Configurable no-nap hours** — set your own start and end time
 - 💪 **Vibration strength** — Gentle / Medium / Strong
 - 🎛️ **Detection sensitivity** — tune the HR drop threshold to your physiology
-- 📊 **Live debug telemetry** — GUARDING screen shows real-time HR, avg, VMC, streak count
-- 🔋 **Battery efficient** — VMC is free from the OS; Tier 1 rides on HR samples already being taken
+- 📊 **Live debug telemetry** — GUARDING screen shows real-time HR, baseline, VMC, streak, analysis age
+- 🔋 **Battery-aware** — sensors idle outside the window; boosted HR sampling runs only while guarding
 
 ---
 
@@ -118,9 +125,9 @@ Open settings from the main screen with a **long-press on SELECT**.
 
 | Level | HR drop required | Use when |
 |---|---|---|
-| **Sensitive** | 8% below rolling average | Missing naps (not triggering enough) |
-| **Balanced** | 13% below rolling average | Default — works for most people |
-| **Conservative** | 20% below rolling average | Too many false positives |
+| **Sensitive** | 8% below awake baseline | Missing naps (not triggering enough) |
+| **Balanced** | 13% below awake baseline | Default — works for most people |
+| **Conservative** | 20% below awake baseline | Too many false positives |
 
 ### Active days picker
 
@@ -149,7 +156,7 @@ The settings row shows a smart summary: `Every day`, `Weekdays`, `Weekends`, or 
 When in GUARDING state, the home screen shows a live readout:
 
 ```
-HR:68 base:74 vmc:42 x1
+HR:68 base:74 vmc:42 x1 2m
 ```
 
 | Field | Meaning |
@@ -157,11 +164,14 @@ HR:68 base:74 vmc:42 x1
 | `HR:` | Current heart rate BPM (3-sample smoothed) |
 | `base:` | Your anchored awake baseline HR |
 | `vmc:` | Vector Magnitude Count — motion intensity this minute (0–100 = still, 500+ = active) |
-| `x1` | Consecutive trigger streak (alarm fires at x2 or higher) |
+| `x1` | Consecutive positive-cycle streak |
+| `2m` | Minutes since the worker last completed an analysis cycle |
+
+**The age field is the first thing to check.** While guarding it should read `0m`–`2m` (boosted 120 s cadence). If it keeps climbing, no analysis is running — HR data isn't reaching the worker (Pebble Health or HR disabled in the mobile app, or the watch rejected the sample-period request).
 
 **Tuning guide:**
-- If it false-triggers: check `vmc:` when it fires. If VMC is high, you were moving — VMC threshold may need raising. If VMC is low with a small HR drop, try **Conservative** sensitivity or raise `STREAK_TO_FIRE`.
-- If it misses naps: check `vmc:` and `HR:` while drowsy. If HR isn't dropping much, try **Sensitive**. If VMC is high during naps (restless sleeper), the VMC gate may be too aggressive.
+- If it false-triggers: check `vmc:` when it fires. If VMC is high, you were moving — VMC threshold may need raising. If VMC is low with a small HR drop, try **Conservative** sensitivity or raise `ALARM_AFTER_SECS` in `worker.c`.
+- If it misses naps: check `vmc:` and `HR:` while drowsy. If HR isn't dropping much, try **Sensitive**. If VMC is high during naps (restless sleeper), the VMC gate may be too aggressive — though since v1.8.0 a single restless minute no longer resets the streak (the VMC trend has to rise too).
 
 ---
 
@@ -247,20 +257,24 @@ nap-buster/
 │   ├── days_window.h
 │   └── common.h              # Shared constants, persist keys, vibe patterns, helpers
 └── worker_src/c/
-    └── worker.c              # Background worker v5 — anchored baseline + two-tier sleep detection
+    └── worker.c              # Background worker v6 — owned HR cadence + two-tier sleep detection
 ```
 
 ### Key design decisions
 
-**HR is the primary signal, VMC is the gate.** HR drop is a genuine physiological marker of sleep onset. VMC only rules out cases where HR happened to dip while the user was clearly moving. The algorithm requires both: HR drops AND movement is low, sustained across 2 consecutive HR events.
+**HR is the primary signal, VMC is the gate.** HR drop is a genuine physiological marker of sleep onset. VMC only rules out cases where HR happened to dip while the user was clearly moving. The algorithm requires both — HR dropped AND movement low — sustained over both a minimum number of cycles and a minimum wall-clock time.
 
-**`HealthMinuteData.vmc` over raw accelerometer.** VMC is pre-computed by the OS health subsystem — no extra sensor power, no manual `√(x²+y²+z²)` computation, a full-minute aggregate rather than a single noisy instantaneous sample.
+**Own the sample cadence while guarding.** The OS's default background HR sampling is ~every 10 minutes, and *slower* during long stillness — precisely when a nap is happening. Inside the window the worker calls `health_service_set_heart_rate_sample_period(60)` so evidence arrives every minute; outside the window it rides the free OS samples. This was the single biggest v1.7 → v1.8 fix: without it, detection latency was unpredictable and the promised "~10 min" was unachievable.
 
-**Anchored awake HR baseline, not a rolling average.** A rolling average chases HR downward during a gradual nap onset and never crosses the threshold — this was the core failure mode. The anchored baseline only updates in the resting-awake VMC zone (50–400): frozen during exercise (avoids baseline inflating to 110 bpm after a run) and frozen during stillness (avoids drifting down with sleep onset). A 3-sample smoothing buffer on the current HR reduces single-reading noise before the comparison.
+**Missing data freezes, never resets.** `health_service_peek_current_value(HeartRateBPM)` returns 0 once the filtered sample is >15 min old, and recent `HealthMinuteData` records can be invalid or lagging. Any such cycle is skipped with all detection state intact. Treating "no data" as "user is awake" was v1.7's fatal bug — the streak was zeroed mid-nap by stale reads, so the full alarm could effectively never fire.
 
-**Piggybacking on OS HR events** — `HealthEventHeartRateUpdate` fires when the OS takes a HR reading anyway. Tier 1 analysis is free; the 5-min fallback timer only peeks HR when the OS hasn't done so recently (slow/off background sampling).
+**Time-based two-stage wake.** Nudge and alarm require sustained wall-clock evidence (≥4 min / ≥10 min), not raw event counts, so behavior is the same whether events arrive every minute (boost accepted) or every ten (boost rejected). Nudges have a 10-minute cooldown; a dismissed alarm sets a 10-minute re-fire cooldown (the OS's sleep classification stays stale for a while after you actually wake).
 
-**HR buffer always warm** — sampling continues outside the guard window on HR-capable platforms. `prv_try_launch_foreground()` guards against out-of-window firing, so collecting data outside is safe.
+**`HealthMinuteData.vmc` over raw accelerometer.** VMC is pre-computed by the OS health subsystem — no extra sensor power, no manual `√(x²+y²+z²)` computation, a full-minute aggregate rather than a single noisy instantaneous sample. The stillness gate passes if either the current minute *or* the VMC trend (EMA) is below threshold, so one restless minute mid-nap doesn't discard the streak.
+
+**Anchored awake HR baseline, not a rolling average.** A rolling average chases HR downward during a gradual nap onset and never crosses the threshold. The anchored baseline updates upward freely (unless exercising, which would inflate it) and downward only with awake-zone movement (VMC ≥ 50) — so it converges to your true resting HR but can't follow a doze down. Seeding requires movement evidence; values are clamped to 40–120 BPM.
+
+**HR buffer always warm** — on HR-capable platforms the health subscription and fallback timer run permanently (piggybacked events cost nothing), so the baseline is real at the moment the window opens. `prv_try_launch_foreground()` guards against out-of-window firing, so collecting data outside is safe — and a nap already in progress when the window opens alarms within minutes.
 
 **`common.h` is the single source of truth** for all persist keys, default values, vibration patterns, and `is_in_no_nap_window()`. Worker has its own copies of keys it needs (can't include `common.h`).
 
@@ -284,14 +298,18 @@ nap-buster/
 | `8` | `ACTIVE_DAYS` | uint8 bitmask | bit0=Sun..bit6=Sat |
 | `10` | `HR_BUFFER` | int16_t[8] blob | Rolling HR circular buffer |
 | `11` | `HR_BUF_IDX` | uint8 | Write index into HR buffer |
-| `12` | `HR_BUF_COUNT` | uint8 | Number of valid HR readings (0–8) |
-| `13` | `TRIGGER_STREAK` | uint8 | Consecutive Tier 1 trigger count |
+| `12` | `HR_BUF_COUNT` | uint8 | Number of valid HR readings (0–3) |
+| `13` | `TRIGGER_STREAK` | uint8 | Consecutive Tier 1 positive cycles |
 | `14` | `VMC_EMA` | uint32 | EMA of VMC (Vector Magnitude Count) |
-| `15` | `DEBUG_HR` | int16 | Last HR BPM seen by worker |
-| `16` | `DEBUG_AVG` | int16 | Last rolling HR average |
+| `15` | `DEBUG_HR` | int16 | Last smoothed HR BPM seen by worker |
+| `16` | `DEBUG_AVG` | int16 | Anchored awake baseline (display) |
 | `17` | `DEBUG_ACCEL` | int32 | Last VMC reading |
 | `18` | `SENSITIVITY` | int | 0=Sensitive 1=Balanced 2=Conservative |
-| `19` | `HR_AWAKE_BASELINE` | int16 | Anchored awake HR baseline (updated only in resting VMC zone) |
+| `19` | `HR_AWAKE_BASELINE` | int16 | Anchored awake HR baseline |
+| `20` | `NUDGE_PENDING` | bool | Worker requests a nudge pulse from foreground |
+| `21` | `LAST_DISMISS` | time_t | Last alarm dismissal — worker re-fire cooldown |
+| `22` | `STREAK_START` | time_t | Start of the current positive-cycle streak |
+| `23` | `DEBUG_LAST_TS` | time_t | When the worker last completed an analysis |
 
 ---
 
@@ -308,10 +326,11 @@ nap-buster/
 
 | Platform | Method | Nudge latency | Full alarm latency |
 |---|---|---|---|
-| Pebble Time 2 / Pebble 2 | HR + VMC (Tier 1) | ~10 min after nap onset | ~20 min (if nudge ignored) |
-| All platforms | HealthService sleep event (Tier 2) | — | 45–90 min (OS confirmed) |
+| Pebble Time 2 / Pebble 2 | HR + VMC, boosted 120 s cadence (Tier 1) | ~4–6 min sustained evidence | ~10–12 min (if nudge ignored) |
+| Pebble Time 2 / Pebble 2 | HR + VMC, boost rejected by OS (Tier 1 degraded) | ~10–20 min | ~20–30 min |
+| All platforms | HealthService sleep event (Tier 2) | — | 45–90 min (OS confirmed; short naps may never classify) |
 
-Tier 1 requires 2 consecutive HR events showing a drop, so latency depends on the OS HR sampling interval (~10 min default). The nudge fires on the 1st hit; the full alarm fires on the 2nd.
+Tier 1 fires on *sustained* evidence: at least 2 positive cycles spanning ≥4 minutes for the nudge, at least 3 spanning ≥10 minutes for the full alarm. Add the physiological lag between closing your eyes and your HR actually settling (~5 min) to get wall-clock time from nap onset.
 
 ---
 

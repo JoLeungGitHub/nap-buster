@@ -26,6 +26,9 @@
 #define PERSIST_KEY_SENSITIVITY      18  // int: 0=Sensitive 1=Balanced 2=Conservative
 #define PERSIST_KEY_HR_BASELINE      19  // int16: anchored awake HR baseline
 #define PERSIST_KEY_NUDGE_PENDING    20  // bool: worker requests a nudge pulse from foreground
+#define PERSIST_KEY_LAST_DISMISS     21  // time_t: last alarm dismissal (worker cooldown gate)
+#define PERSIST_KEY_STREAK_START     22  // time_t: worker-internal — start of current streak
+#define PERSIST_KEY_DEBUG_LAST_TS    23  // time_t: when the worker last completed an analysis
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
@@ -103,7 +106,10 @@ static inline int settings_get_vibe_strength(void) {
 
 static inline uint8_t settings_get_active_days(void) {
     if (!persist_exists(PERSIST_KEY_ACTIVE_DAYS)) return DEFAULT_ACTIVE_DAYS;
-    return (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS);
+    // A stored 0 would mean "never guard" — treat as corrupt (e.g. leftover
+    // bool from the pre-1.x weekdays toggle that shared this key) and default.
+    uint8_t days = (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS) & 0x7F;
+    return days ? days : DEFAULT_ACTIVE_DAYS;
 }
 
 static inline int settings_get_sensitivity(void) {
