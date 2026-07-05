@@ -158,6 +158,25 @@ static void stop_alarm(void) {
     update_home_screen();
 }
 
+/** Cancel an active snooze and resume guarding immediately (SELECT while
+ *  SNOOZED). Tells the worker to reload settings, which clears its launch
+ *  guard and re-evaluates the window/streak fresh — same as a normal
+ *  settings-change reconcile. */
+static void cancel_snooze(void) {
+    if (!persist_exists(PERSIST_KEY_SNOOZE_UNTIL)) return;
+    time_t snooze_until = (time_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL);
+    if (snooze_until <= time(NULL)) return;  // not actually snoozed
+
+    cancel_existing_wakeup();
+    persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
+
+    AppWorkerMessage msg = { .data0 = APP_MSG_SETTINGS_CHANGED };
+    app_worker_send_message(APP_MSG_SETTINGS_CHANGED, &msg);
+
+    vibes_double_pulse();
+    update_home_screen();
+}
+
 static void schedule_snooze(int minutes) {
     if (s_vibe_timer) {
         app_timer_cancel(s_vibe_timer);
@@ -317,7 +336,7 @@ static void update_home_screen(void) {
                      "Resuming in\n%d min", snooze_mins_left);
             text_layer_set_text(s_detail_label, detail_buf);
             text_layer_set_text(s_days_label,   "");
-            text_layer_set_text(s_hint_label,   "Hold SEL: settings");
+            text_layer_set_text(s_hint_label,   "SEL: resume now");
             break;
 
         case HOME_STATE_DISABLED:
@@ -391,7 +410,11 @@ static void worker_message_handler(uint16_t type, AppWorkerMessage *msg) {
 // ─── Click handlers ──────────────────────────────────────────────────────────
 
 static void select_click(ClickRecognizerRef r, void *ctx) {
-    if (s_is_alarming) stop_alarm();
+    if (s_is_alarming) {
+        stop_alarm();
+        return;
+    }
+    cancel_snooze();  // no-op if not currently snoozed
 }
 
 static void select_long_click(ClickRecognizerRef r, void *ctx) {

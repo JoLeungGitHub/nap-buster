@@ -36,7 +36,7 @@
 #define DEFAULT_END_HOUR             23  // 11:00 PM
 #define DEFAULT_VIBE_STRENGTH        1   // Medium
 #define DEFAULT_ACTIVE_DAYS          0x7F  // every day (bits 0-6 set)
-#define DEFAULT_SENSITIVITY          1   // Balanced (13% drop)
+#define DEFAULT_SENSITIVITY          1   // Balanced (16% drop)
 
 // ─── Worker / App Message Keys ────────────────────────────────────────────────
 #define WORKER_MSG_SLEEP_DETECTED    0
@@ -118,12 +118,13 @@ static inline int settings_get_sensitivity(void) {
 }
 
 /** Map sensitivity level to the HR-drop percentage threshold.
- *  hr_val * 100 < rolling_avg * threshold  →  drop detected. */
+ *  hr_val * 100 < rolling_avg * threshold  →  drop detected.
+ *  Values kept in sync with worker_src/c/worker.c:prv_get_hr_drop_pct(). */
 static inline int sensitivity_to_drop_pct(int level) {
     switch (level) {
-        case 0: return 92;  // Sensitive:     8% drop triggers
-        case 2: return 80;  // Conservative: 20% drop triggers
-        default: return 87; // Balanced:     13% drop triggers
+        case 0: return 90;  // Sensitive:     10% drop triggers
+        case 2: return 76;  // Conservative: 24% drop triggers
+        default: return 84; // Balanced:     16% drop triggers
     }
 }
 

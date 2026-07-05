@@ -188,15 +188,22 @@ static int prv_get_end_hour(void) {
     return persist_read_int(PERSIST_KEY_END_HOUR);
 }
 
-/** Return the HR-drop threshold percentage based on persisted sensitivity. */
+/**
+ * Return the HR-drop threshold percentage based on persisted sensitivity.
+ *
+ * Bumped up (bigger required drop) from the original 8/13/20% — normal
+ * resting relaxation (sitting/lying still, reading, watching TV) commonly
+ * drops HR 10-15% below an "active" baseline via vagal tone without being
+ * sleep onset. The old thresholds were catching that as a nap.
+ */
 static int prv_get_hr_drop_pct(void) {
     int level = persist_exists(PERSIST_KEY_SENSITIVITY)
                 ? persist_read_int(PERSIST_KEY_SENSITIVITY)
                 : DEFAULT_SENSITIVITY;
     switch (level) {
-        case 0: return 92;  // Sensitive:     8% drop
-        case 2: return 80;  // Conservative: 20% drop
-        default: return 87; // Balanced:     13% drop
+        case 0: return 90;  // Sensitive:     10% drop
+        case 2: return 76;  // Conservative: 24% drop
+        default: return 84; // Balanced:     16% drop
     }
 }
 
