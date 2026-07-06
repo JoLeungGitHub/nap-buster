@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NapBuster — the Pebble app that won't let you nap</title>
+<meta name="description" content="NapBuster watches your heart rate and busts daytime naps before they wreck your night's sleep. For Pebble Time 2, Pebble 2, Pebble Time and Time Round.">
+<link rel="icon" type="image/png" href="img/icon.png">
+<style>
+  :root {
+    --bg:      #0a0c0a;
+    --panel:   #141814;
+    --panel-2: #1a1f1a;
+    --line:    #242a24;
+    --ink:     #e9efe9;
+    --muted:   #97a397;
+    --green:   #3fd465;
+    --amber:   #ffb03a;
+    --red:     #ff5349;
+    --mono:    ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Courier New", monospace;
+    --sans:    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.6;
+  }
+  /* the app's coloured state bar, as a page motif */
+  .statebar { height: 6px; background: var(--green); }
+
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+  section { padding: 64px 0; }
+  h1, h2, h3, .mono { font-family: var(--mono); }
+  h2 {
+    font-size: 1.15rem; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--green); margin-bottom: 28px;
+  }
+  h2::before { content: "// "; color: var(--muted); }
+  p.lead { font-size: 1.15rem; color: var(--ink); max-width: 640px; }
+  .muted { color: var(--muted); }
+  a { color: var(--green); }
+
+  /* ── hero ─────────────────────────────────────────────── */
+  header { padding: 72px 0 56px; text-align: center; }
+  .hero-icon {
+    width: 72px; height: 72px; image-rendering: pixelated;
+    border: 2px solid var(--line); border-radius: 16px; background: var(--panel);
+    padding: 6px;
+  }
+  h1 {
+    font-size: clamp(2.2rem, 7vw, 3.6rem);
+    letter-spacing: .08em; margin: 18px 0 4px;
+  }
+  h1 .bust { color: var(--red); }
+  .face {
+    font-family: var(--mono); font-size: clamp(1.6rem, 5vw, 2.4rem);
+    color: var(--green); display: inline-block; margin: 10px 0 2px;
+    min-width: 7ch;
+  }
+  .face::after { content: "(^_^)"; }
+  @keyframes doze {
+    0%, 50%   { content: "(^_^)"; }
+    55%, 78%  { content: "(-_-)"; }
+    83%, 100% { content: "(>_<)"; }
+  }
+  @keyframes buzz {
+    0%, 82%  { transform: translateX(0); color: var(--green); }
+    84%      { transform: translateX(-2px); color: var(--red); }
+    88%      { transform: translateX(2px);  color: var(--red); }
+    92%      { transform: translateX(-2px); color: var(--red); }
+    96%      { transform: translateX(2px);  color: var(--red); }
+    100%     { transform: translateX(0);    color: var(--red); }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .face::after { animation: doze 7s steps(1, end) infinite; }
+    .face { animation: buzz 7s linear infinite; }
+  }
+  .tagline { font-size: 1.3rem; margin-top: 10px; }
+  .sub { color: var(--muted); max-width: 560px; margin: 10px auto 0; }
+
+  .badges { margin: 26px 0 30px; }
+  .badge {
+    display: inline-block; font-family: var(--mono); font-size: .78rem;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 12px; margin: 4px; color: var(--muted); background: var(--panel);
+  }
+  .badge b { color: var(--green); font-weight: 500; }
+
+  .cta a {
+    display: inline-block; font-family: var(--mono); text-decoration: none;
+    padding: 12px 26px; margin: 6px; border-radius: 8px; font-size: .95rem;
+  }
+  .cta .primary { background: var(--green); color: #06210d; font-weight: 700; }
+  .cta .primary:hover { filter: brightness(1.1); }
+  .cta .ghost { border: 2px solid var(--line); color: var(--ink); }
+  .cta .ghost:hover { border-color: var(--green); }
+
+  /* ── problem strip ────────────────────────────────────── */
+  .strip {
+    background: var(--panel); border-top: 2px solid var(--line);
+    border-bottom: 2px solid var(--line); padding: 34px 0;
+    text-align: center; font-family: var(--mono);
+  }
+  .strip .t { color: var(--muted); font-size: .95rem; }
+  .strip .big { font-size: 1.25rem; margin-top: 6px; }
+  .strip .big em { color: var(--amber); font-style: normal; }
+  .strip .big strong { color: var(--red); font-weight: 500; }
+
+  /* ── how it works ─────────────────────────────────────── */
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .step {
+    background: var(--panel); border: 2px solid var(--line); border-radius: 12px;
+    padding: 22px;
+  }
+  .step .n { font-family: var(--mono); color: var(--muted); font-size: .8rem; }
+  .step h3 { margin: 6px 0 8px; font-size: 1rem; letter-spacing: .06em; }
+  .step p { color: var(--muted); font-size: .93rem; }
+  .step.green h3 { color: var(--green); }
+  .step.amber h3 { color: var(--amber); }
+  .step.red   h3 { color: var(--red); }
+
+  .timeline { margin: 40px 0 8px; }
+  .tl-bar {
+    position: relative; height: 4px; border-radius: 2px; margin: 46px 8px 14px;
+    background: linear-gradient(90deg, var(--green) 0 38%, var(--amber) 38% 76%, var(--red) 76% 100%);
+  }
+  .tl-dot {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 14px; height: 14px; border-radius: 50%; border: 3px solid var(--bg);
+  }
+  .tl-lbl {
+    position: absolute; transform: translateX(-50%); bottom: 16px;
+    font-family: var(--mono); font-size: .78rem; color: var(--muted); white-space: nowrap;
+  }
+  .tl-lbl.first { transform: none; }
+  @media (max-width: 620px) {
+    .tl-lbl { font-size: .72rem; }
+    .tl-lbl.mid { bottom: auto; top: 16px; }   /* drop below the bar */
+    .tl-bar { margin-bottom: 48px; }
+  }
+  .tl-lbl b { color: var(--ink); font-weight: 500; }
+
+  .how-notes { margin-top: 34px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .note { border-left: 3px solid var(--line); padding: 2px 0 2px 16px; }
+  .note h3 { font-size: .92rem; margin-bottom: 6px; color: var(--ink); letter-spacing: .04em; }
+  .note p { font-size: .9rem; color: var(--muted); }
+  .note code { font-family: var(--mono); color: var(--amber); font-size: .85em; }
+
+  /* ── screens ──────────────────────────────────────────── */
+  .screens { display: flex; flex-wrap: wrap; gap: 28px; justify-content: center; }
+  figure.watch { text-align: center; }
+  .bezel {
+    position: relative; display: inline-block; background: var(--panel-2);
+    border: 2px solid var(--line); border-radius: 26px; padding: 16px 14px;
+  }
+  .bezel::after { /* side buttons */
+    content: ""; position: absolute; right: -8px; top: 26%; width: 6px; height: 48%;
+    background: repeating-linear-gradient(
+      to bottom, var(--line) 0 22%, transparent 22% 39%,
+      var(--line) 39% 61%, transparent 61% 78%, var(--line) 78% 100%);
+    border-radius: 3px;
+  }
+  .bezel img {
+    display: block; width: 200px; image-rendering: pixelated;
+    border-radius: 6px;
+  }
+  figcaption { font-family: var(--mono); font-size: .8rem; color: var(--muted); margin-top: 12px; }
+  figcaption b { color: var(--green); font-weight: 500; }
+
+  /* debug line easter egg */
+  .debugline {
+    text-align: center; font-family: var(--mono); font-size: .85rem;
+    color: var(--muted); margin-top: 34px;
+  }
+  .debugline span { color: var(--green); }
+
+  /* ── features ─────────────────────────────────────────── */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+  .feat {
+    background: var(--panel); border: 2px solid var(--line); border-radius: 12px;
+    padding: 18px;
+  }
+  .feat h3 { font-size: .9rem; letter-spacing: .04em; margin-bottom: 6px; }
+  .feat p { font-size: .88rem; color: var(--muted); }
+
+  /* ── watches table ────────────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  th, td { text-align: left; padding: 12px 14px; border: 2px solid var(--line); }
+  th { font-family: var(--mono); font-size: .78rem; letter-spacing: .1em;
+       text-transform: uppercase; color: var(--muted); background: var(--panel); }
+  td b { font-weight: 600; }
+  .ok  { color: var(--green); }
+  .meh { color: var(--amber); }
+  .table-scroll { overflow-x: auto; }
+
+  /* ── install ──────────────────────────────────────────── */
+  pre {
+    background: var(--panel); border: 2px solid var(--line); border-radius: 12px;
+    padding: 20px; overflow-x: auto; font-family: var(--mono); font-size: .88rem;
+    line-height: 1.7;
+  }
+  pre .c { color: var(--muted); }
+  pre .g { color: var(--green); }
+
+  /* ── footer ───────────────────────────────────────────── */
+  footer {
+    border-top: 2px solid var(--line); padding: 40px 0 56px;
+    text-align: center; color: var(--muted); font-size: .9rem;
+  }
+  footer .privacy { font-family: var(--mono); font-size: .82rem; margin-bottom: 14px; color: var(--ink); }
+  footer .privacy::before { content: "🔒 "; }
+</style>
+</head>
+<body>
+
+<div class="statebar"></div>
+
+<header class="wrap">
+  <img class="hero-icon" src="img/icon.png" alt="NapBuster app icon" width="72" height="72">
+  <h1>NAP<span class="bust">BUSTER</span></h1>
+  <div class="face" role="img" aria-label="ASCII face dozing off and getting buzzed awake"></div>
+  <p class="tagline">Your watch won't let you nap.</p>
+  <p class="sub">Daytime dozing steals your night. NapBuster reads your heart rate,
+     spots a nap forming in minutes, and buzzes it away — entirely on your Pebble.</p>
+
+  <div class="badges">
+    <span class="badge"><b>v1.8.0</b></span>
+    <span class="badge">MIT license</span>
+    <span class="badge">Pebble Time 2 · Pebble 2 · Time · Round</span>
+    <span class="badge">no phone app needed</span>
+  </div>
+
+  <div class="cta">
+    <a class="primary" href="https://github.com/JoLeungGitHub/nap-buster">View on GitHub</a>
+    <a class="ghost" href="#install">Build &amp; install ↓</a>
+  </div>
+</header>
+
+<div class="strip">
+  <div class="wrap">
+    <div class="t">the doom loop</div>
+    <div class="big">nap at <em>15:30</em> → wide awake at <strong>01:00</strong> → exhausted → nap at <em>15:30</em> …</div>
+  </div>
+</div>
+
+<section class="wrap" id="how">
+  <h2>How it works</h2>
+  <p class="lead">A background worker guards your configured no-nap hours with
+     two-tier detection. Heart rate is the primary signal — as you drift off,
+     your HR sinks below your awake baseline. Motion (VMC) is the gate that
+     rules out false alarms while you're up and about.</p>
+
+  <div class="timeline" aria-label="Detection timeline from nap onset to alarm">
+    <div class="tl-bar">
+      <span class="tl-dot" style="left:0%; background:var(--green);"></span>
+      <span class="tl-lbl first" style="left:0%;"><b>0 min</b> eyes close</span>
+      <span class="tl-dot" style="left:38%; background:var(--amber);"></span>
+      <span class="tl-lbl mid" style="left:38%;"><b>~4–5 min</b> quiet nudge</span>
+      <span class="tl-dot" style="left:76%; background:var(--red);"></span>
+      <span class="tl-lbl" style="left:76%;"><b>~10 min</b> full alarm</span>
+    </div>
+  </div>
+
+  <div class="steps">
+    <div class="step green">
+      <div class="n mono">TIER 1 · STEP 1</div>
+      <h3>WATCH THE HEART</h3>
+      <p>While guarding, NapBuster samples your heart rate every 60 seconds.
+         When the smoothed value drops 8–20% (your choice) below your anchored
+         awake baseline <em>and</em> you're very still, a streak starts counting.</p>
+    </div>
+    <div class="step amber">
+      <div class="n mono">TIER 1 · STEP 2</div>
+      <h3>NUDGE FIRST</h3>
+      <p>After ~4 minutes of sustained evidence: a quiet double pulse. If you
+         were just relaxing, you'll barely notice. If you were drifting off,
+         it's enough to break the slide.</p>
+    </div>
+    <div class="step red">
+      <div class="n mono">TIER 1 · STEP 3</div>
+      <h3>THEN THE ALARM</h3>
+      <p>Still sinking at ~10 minutes? The full repeating alarm fires and keeps
+         buzzing until you dismiss it — or snooze for 10/30 min if you've earned it.</p>
+    </div>
+  </div>
+
+  <div class="how-notes">
+    <div class="note">
+      <h3>Anchored awake baseline</h3>
+      <p>Your reference HR never chases you into a nap: it moves up freely
+         (unless you're exercising) but only moves down when movement proves
+         you're awake. A rolling average can't do that.</p>
+    </div>
+    <div class="note">
+      <h3>Tier 2 safety net</h3>
+      <p>On every Pebble — including watches without a heart-rate sensor —
+         the OS's own sleep classification is a fallback trigger. Slower
+         (45–90 min), but it catches what Tier 1 can't.</p>
+    </div>
+    <div class="note">
+      <h3>Honest battery math</h3>
+      <p>Outside your no-nap window, NapBuster piggybacks on samples the OS
+         takes anyway — zero extra cost. Inside the window it requests
+         60-second HR sampling; that's the one real spend, and it stops the
+         moment the window closes. (Tunable via <code>HR_BOOST_PERIOD_SECS</code>.)</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap" id="screens">
+  <h2>On the wrist</h2>
+  <div class="screens">
+    <figure class="watch">
+      <div class="bezel"><img src="img/guarding.png" alt="NapBuster GUARDING screen: green happy ASCII face, schedule 00:00 to 23:00, every day" width="200" height="228"></div>
+      <figcaption><b>GUARDING</b> — window open, HR watched</figcaption>
+    </figure>
+    <figure class="watch">
+      <div class="bezel"><img src="img/offhours.png" alt="NapBuster OFF-HOURS screen: neutral ASCII face, guard starts at 11:00" width="200" height="228"></div>
+      <figcaption><b>OFF-HOURS</b> — nap freely, it starts later</figcaption>
+    </figure>
+    <figure class="watch">
+      <div class="bezel"><img src="img/settings.png" alt="NapBuster settings screen: guard toggle, active days, no-nap window hours" width="200" height="228"></div>
+      <figcaption><b>SETTINGS</b> — hours, days, vibe, sensitivity</figcaption>
+    </figure>
+    <figure class="watch">
+      <div class="bezel"><img src="img/days.png" alt="NapBuster active days picker with Sunday, Monday, Tuesday toggled on" width="200" height="228"></div>
+      <figcaption><b>ACTIVE DAYS</b> — weekdays only? sure</figcaption>
+    </figure>
+  </div>
+  <div class="debugline">live telemetry while guarding:&nbsp; <span>HR:68 base:74 vmc:42 x1 0m</span></div>
+</section>
+
+<section class="wrap" id="features">
+  <h2>Features</h2>
+  <div class="grid">
+    <div class="feat"><h3>🔬 Minute-level detection</h3><p>Owned 60 s HR cadence inside the guard window — not the OS's lazy 10-minute default.</p></div>
+    <div class="feat"><h3>🔔 Two-stage wake</h3><p>Gentle nudge first; the full alarm only if you keep sinking. Both time-based, not sample-count roulette.</p></div>
+    <div class="feat"><h3>💤 Snooze that survives</h3><p>10 or 30 minutes via the Wakeup API — works even if the app closes.</p></div>
+    <div class="feat"><h3>📅 Per-day schedule</h3><p>Guard weekdays, weekends, or any custom set of days and hours.</p></div>
+    <div class="feat"><h3>💪 Three vibe strengths</h3><p>Gentle, Medium, Strong — pulse-density patterns, test-buzzed as you pick.</p></div>
+    <div class="feat"><h3>🎛️ Tunable sensitivity</h3><p>Sensitive / Balanced / Conservative HR-drop thresholds to match your physiology.</p></div>
+    <div class="feat"><h3>📊 Live telemetry</h3><p>HR, baseline, motion, streak and analysis age right on the watch face — see it working.</p></div>
+    <div class="feat"><h3>🛡️ Fallback tier</h3><p>OS sleep classification backs up the HR engine on all supported watches.</p></div>
+  </div>
+</section>
+
+<section class="wrap" id="watches">
+  <h2>Supported watches</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Platform</th><th>Watch</th><th>Detection</th></tr>
+    <tr><td class="mono">emery</td><td><b>Pebble Time 2</b> <span class="muted">(primary target)</span></td><td class="ok">Tier 1 (HR + motion) + Tier 2</td></tr>
+    <tr><td class="mono">diorite</td><td><b>Pebble 2 HR</b></td><td class="ok">Tier 1 (HR + motion) + Tier 2</td></tr>
+    <tr><td class="mono">basalt</td><td>Pebble Time / Time Steel</td><td class="meh">Tier 2 only (no HR sensor)</td></tr>
+    <tr><td class="mono">chalk</td><td>Pebble Time Round</td><td class="meh">Tier 2 only (no HR sensor)</td></tr>
+  </table>
+  </div>
+  <p class="muted" style="margin-top:14px; font-size:.88rem;">Requires Pebble Health enabled in the rePebble mobile app (Devices → Health).</p>
+</section>
+
+<section class="wrap" id="install">
+  <h2>Build &amp; install</h2>
+  <pre><span class="c"># one-time: pebble-tool needs Python 3.11</span>
+uv venv ~/.pebble-venv --python 3.11
+~/.pebble-venv/bin/pip install pebble-tool
+~/.pebble-venv/bin/pebble sdk install latest
+
+<span class="c"># build</span>
+git clone https://github.com/JoLeungGitHub/nap-buster.git
+cd nap-buster
+~/.pebble-venv/bin/pebble build          <span class="g"># → build/napbuster.pbw</span>
+
+<span class="c"># install to your watch (enable Dev Connect in the rePebble app first)</span>
+~/.pebble-venv/bin/pebble login
+~/.pebble-venv/bin/pebble install --cloudpebble</pre>
+  <p class="muted" style="margin-top:14px; font-size:.88rem;">
+    Full SDK setup instructions at
+    <a href="https://developer.repebble.com/sdk/">developer.repebble.com/sdk</a>.
+  </p>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="privacy">No cloud. No phone app. No account. Your heart rate never leaves your wrist.</div>
+    <div>
+      <a href="https://github.com/JoLeungGitHub/nap-buster">GitHub</a> ·
+      MIT license · built for the <a href="https://repebble.com">rePebble</a> revival
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
