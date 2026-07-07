@@ -6,6 +6,7 @@
 <title>NapBuster — the Pebble app that won't let you nap</title>
 <meta name="description" content="NapBuster watches your heart rate and busts daytime naps before they wreck your night's sleep. For Pebble Time 2, Pebble 2, Pebble Time and Time Round.">
 <link rel="icon" type="image/png" href="img/icon.png">
+<meta name="theme-color" content="#0a0c0a">
 <style>
   :root {
     --bg:      #0a0c0a;
@@ -21,7 +22,9 @@
     --sans:    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+  }
   body {
     background: var(--bg);
     color: var(--ink);
@@ -212,6 +215,78 @@
   }
   footer .privacy { font-family: var(--mono); font-size: .82rem; margin-bottom: 14px; color: var(--ink); }
   footer .privacy::before { content: "🔒 "; }
+
+  /* ── motion & elevation ───────────────────────────────── */
+  /* resting elevation — dark, soft, keeps the flat terminal look honest */
+  .step, .feat {
+    box-shadow: 0 1px 0 rgba(0,0,0,.35), 0 14px 30px -20px rgba(0,0,0,.9);
+  }
+  .bezel { box-shadow: 0 24px 44px -22px rgba(0,0,0,.85); }
+  pre    { box-shadow: 0 14px 30px -22px rgba(0,0,0,.9); }
+
+  /* hover raises — pointer devices only */
+  @media (hover: hover) and (pointer: fine) {
+    .step:hover, .feat:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 1px 0 rgba(0,0,0,.35), 0 22px 38px -18px rgba(0,0,0,.95);
+    }
+    .step.green:hover { border-color: var(--green); }
+    .step.amber:hover { border-color: var(--amber); }
+    .step.red:hover   { border-color: var(--red); }
+    .feat:hover       { border-color: var(--green); }
+    figure.watch:hover .bezel { transform: translateY(-4px); box-shadow: 0 32px 52px -22px rgba(0,0,0,.95); }
+    .cta .primary:hover { transform: translateY(-2px); box-shadow: 0 0 22px rgba(63,212,101,.28), 0 10px 24px -12px rgba(0,0,0,.8); }
+    .cta .ghost:hover   { transform: translateY(-2px); }
+  }
+  .cta a:active { transform: translateY(0) scale(.98); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .step, .feat, .bezel, .cta a {
+      transition: transform .22s cubic-bezier(.22,1,.36,1),
+                  border-color .22s ease,
+                  box-shadow .22s ease;
+    }
+
+    /* boot sequence — the state bar scans in, the hero rises after it */
+    @keyframes scanin { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+    @keyframes rise   { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+    @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+    .statebar        { transform-origin: left; animation: scanin .8s cubic-bezier(.22,1,.36,1) both; }
+    header .hero-icon { animation: rise .55s cubic-bezier(.22,1,.36,1) both .05s; }
+    header h1         { animation: rise .55s cubic-bezier(.22,1,.36,1) both .12s; }
+    header .face      { animation: buzz 7s linear infinite, fadein .55s ease both .2s; }
+    header .tagline   { animation: rise .55s cubic-bezier(.22,1,.36,1) both .26s; }
+    header .sub       { animation: rise .55s cubic-bezier(.22,1,.36,1) both .32s; }
+    header .badges    { animation: rise .55s cubic-bezier(.22,1,.36,1) both .38s; }
+    header .cta       { animation: rise .55s cubic-bezier(.22,1,.36,1) both .44s; }
+
+    /* alarm dot ping — starts once the timeline has drawn */
+    @keyframes ping {
+      0%   { box-shadow: 0 0 0 0 rgba(255,83,73,.55); }
+      70%  { box-shadow: 0 0 0 10px rgba(255,83,73,0); }
+      100% { box-shadow: 0 0 0 0 rgba(255,83,73,0); }
+    }
+    html.motion [data-reveal].in .tl-dot.ping { animation: ping 2.8s cubic-bezier(.22,1,.36,1) 1.5s infinite; }
+  }
+
+  /* scroll reveals — html.motion is set by JS only when motion is welcome,
+     so no-JS and reduced-motion visitors get the finished static page */
+  html.motion [data-reveal] {
+    opacity: 0; transform: translateY(16px);
+    transition: opacity .6s cubic-bezier(.22,1,.36,1), transform .6s cubic-bezier(.22,1,.36,1);
+    transition-delay: calc(var(--rd, 0) * 70ms);
+  }
+  html.motion [data-reveal].in { opacity: 1; transform: none; }
+
+  /* the detection timeline draws itself left → right */
+  html.motion .tl-bar::after {
+    content: ""; position: absolute; inset: -1px;
+    background: var(--bg); transform-origin: right center;
+    transition: transform .9s cubic-bezier(.22,1,.36,1) .2s;
+  }
+  html.motion [data-reveal].in .tl-bar::after { transform: scaleX(0); }
+  html.motion .tl-bar > span { opacity: 0; transition: opacity .5s ease .6s; }
+  html.motion [data-reveal].in .tl-bar > span { opacity: 1; }
 </style>
 </head>
 <body>
@@ -240,7 +315,7 @@
   </div>
 </header>
 
-<div class="strip">
+<div class="strip" data-reveal>
   <div class="wrap">
     <div class="t">the doom loop</div>
     <div class="big">nap at <em>15:30</em> → wide awake at <strong>01:00</strong> → exhausted → nap at <em>15:30</em> …</div>
@@ -248,39 +323,39 @@
 </div>
 
 <section class="wrap" id="how">
-  <h2>How it works</h2>
-  <p class="lead">A background worker guards your configured no-nap hours with
+  <h2 data-reveal>How it works</h2>
+  <p class="lead" data-reveal style="--rd:1">A background worker guards your configured no-nap hours with
      two-tier detection. Heart rate is the primary signal — as you drift off,
      your HR sinks below your awake baseline. Motion (VMC) is the gate that
      rules out false alarms while you're up and about.</p>
 
-  <div class="timeline" aria-label="Detection timeline from nap onset to alarm">
+  <div class="timeline" aria-label="Detection timeline from nap onset to alarm" data-reveal>
     <div class="tl-bar">
       <span class="tl-dot" style="left:0%; background:var(--green);"></span>
       <span class="tl-lbl first" style="left:0%;"><b>0 min</b> eyes close</span>
       <span class="tl-dot" style="left:38%; background:var(--amber);"></span>
       <span class="tl-lbl mid" style="left:38%;"><b>~4–5 min</b> quiet nudge</span>
-      <span class="tl-dot" style="left:76%; background:var(--red);"></span>
+      <span class="tl-dot ping" style="left:76%; background:var(--red);"></span>
       <span class="tl-lbl" style="left:76%;"><b>~10 min</b> full alarm</span>
     </div>
   </div>
 
   <div class="steps">
-    <div class="step green">
+    <div class="step green" data-reveal>
       <div class="n mono">TIER 1 · STEP 1</div>
       <h3>WATCH THE HEART</h3>
       <p>While guarding, NapBuster samples your heart rate every 60 seconds.
          When the smoothed value drops 8–20% (your choice) below your anchored
          awake baseline <em>and</em> you're very still, a streak starts counting.</p>
     </div>
-    <div class="step amber">
+    <div class="step amber" data-reveal style="--rd:1">
       <div class="n mono">TIER 1 · STEP 2</div>
       <h3>NUDGE FIRST</h3>
       <p>After ~4 minutes of sustained evidence: a quiet double pulse. If you
          were just relaxing, you'll barely notice. If you were drifting off,
          it's enough to break the slide.</p>
     </div>
-    <div class="step red">
+    <div class="step red" data-reveal style="--rd:2">
       <div class="n mono">TIER 1 · STEP 3</div>
       <h3>THEN THE ALARM</h3>
       <p>Still sinking at ~10 minutes? The full repeating alarm fires and keeps
@@ -289,19 +364,19 @@
   </div>
 
   <div class="how-notes">
-    <div class="note">
+    <div class="note" data-reveal>
       <h3>Anchored awake baseline</h3>
       <p>Your reference HR never chases you into a nap: it moves up freely
          (unless you're exercising) but only moves down when movement proves
          you're awake. A rolling average can't do that.</p>
     </div>
-    <div class="note">
+    <div class="note" data-reveal style="--rd:1">
       <h3>Tier 2 safety net</h3>
       <p>On every Pebble — including watches without a heart-rate sensor —
          the OS's own sleep classification is a fallback trigger. Slower
          (45–90 min), but it catches what Tier 1 can't.</p>
     </div>
-    <div class="note">
+    <div class="note" data-reveal style="--rd:2">
       <h3>Honest battery math</h3>
       <p>Outside your no-nap window, NapBuster piggybacks on samples the OS
          takes anyway — zero extra cost. Inside the window it requests
@@ -312,45 +387,45 @@
 </section>
 
 <section class="wrap" id="screens">
-  <h2>On the wrist</h2>
+  <h2 data-reveal>On the wrist</h2>
   <div class="screens">
-    <figure class="watch">
-      <div class="bezel"><img src="img/guarding.png" alt="NapBuster GUARDING screen: green happy ASCII face, schedule 00:00 to 23:00, every day" width="200" height="228"></div>
+    <figure class="watch" data-reveal>
+      <div class="bezel"><img src="img/guarding.png" alt="NapBuster GUARDING screen: green happy ASCII face, schedule 00:00 to 23:00, every day" width="200" height="228" loading="lazy" decoding="async"></div>
       <figcaption><b>GUARDING</b> — window open, HR watched</figcaption>
     </figure>
-    <figure class="watch">
-      <div class="bezel"><img src="img/offhours.png" alt="NapBuster OFF-HOURS screen: neutral ASCII face, guard starts at 11:00" width="200" height="228"></div>
+    <figure class="watch" data-reveal style="--rd:1">
+      <div class="bezel"><img src="img/offhours.png" alt="NapBuster OFF-HOURS screen: neutral ASCII face, guard starts at 11:00" width="200" height="228" loading="lazy" decoding="async"></div>
       <figcaption><b>OFF-HOURS</b> — nap freely, it starts later</figcaption>
     </figure>
-    <figure class="watch">
-      <div class="bezel"><img src="img/settings.png" alt="NapBuster settings screen: guard toggle, active days, no-nap window hours" width="200" height="228"></div>
+    <figure class="watch" data-reveal style="--rd:2">
+      <div class="bezel"><img src="img/settings.png" alt="NapBuster settings screen: guard toggle, active days, no-nap window hours" width="200" height="228" loading="lazy" decoding="async"></div>
       <figcaption><b>SETTINGS</b> — hours, days, vibe, sensitivity</figcaption>
     </figure>
-    <figure class="watch">
-      <div class="bezel"><img src="img/days.png" alt="NapBuster active days picker with Sunday, Monday, Tuesday toggled on" width="200" height="228"></div>
+    <figure class="watch" data-reveal style="--rd:3">
+      <div class="bezel"><img src="img/days.png" alt="NapBuster active days picker with Sunday, Monday, Tuesday toggled on" width="200" height="228" loading="lazy" decoding="async"></div>
       <figcaption><b>ACTIVE DAYS</b> — weekdays only? sure</figcaption>
     </figure>
   </div>
-  <div class="debugline">live telemetry while guarding:&nbsp; <span>HR:68 base:74 vmc:42 x1 0m</span></div>
+  <div class="debugline" data-reveal>live telemetry while guarding:&nbsp; <span>HR:68 base:74 vmc:42 x1 0m</span></div>
 </section>
 
 <section class="wrap" id="features">
-  <h2>Features</h2>
+  <h2 data-reveal>Features</h2>
   <div class="grid">
-    <div class="feat"><h3>🔬 Minute-level detection</h3><p>Owned 60 s HR cadence inside the guard window — not the OS's lazy 10-minute default.</p></div>
-    <div class="feat"><h3>🔔 Two-stage wake</h3><p>Gentle nudge first; the full alarm only if you keep sinking. Both time-based, not sample-count roulette.</p></div>
-    <div class="feat"><h3>💤 Snooze that survives</h3><p>10 or 30 minutes via the Wakeup API — works even if the app closes.</p></div>
-    <div class="feat"><h3>📅 Per-day schedule</h3><p>Guard weekdays, weekends, or any custom set of days and hours.</p></div>
-    <div class="feat"><h3>💪 Three vibe strengths</h3><p>Gentle, Medium, Strong — pulse-density patterns, test-buzzed as you pick.</p></div>
-    <div class="feat"><h3>🎛️ Tunable sensitivity</h3><p>Sensitive / Balanced / Conservative HR-drop thresholds to match your physiology.</p></div>
-    <div class="feat"><h3>📊 Live telemetry</h3><p>HR, baseline, motion, streak and analysis age right on the watch face — see it working.</p></div>
-    <div class="feat"><h3>🛡️ Fallback tier</h3><p>OS sleep classification backs up the HR engine on all supported watches.</p></div>
+    <div class="feat" data-reveal><h3>🔬 Minute-level detection</h3><p>Owned 60 s HR cadence inside the guard window — not the OS's lazy 10-minute default.</p></div>
+    <div class="feat" data-reveal style="--rd:1"><h3>🔔 Two-stage wake</h3><p>Gentle nudge first; the full alarm only if you keep sinking. Both time-based, not sample-count roulette.</p></div>
+    <div class="feat" data-reveal style="--rd:2"><h3>💤 Snooze that survives</h3><p>10 or 30 minutes via the Wakeup API — works even if the app closes.</p></div>
+    <div class="feat" data-reveal style="--rd:3"><h3>📅 Per-day schedule</h3><p>Guard weekdays, weekends, or any custom set of days and hours.</p></div>
+    <div class="feat" data-reveal><h3>💪 Three vibe strengths</h3><p>Gentle, Medium, Strong — pulse-density patterns, test-buzzed as you pick.</p></div>
+    <div class="feat" data-reveal style="--rd:1"><h3>🎛️ Tunable sensitivity</h3><p>Sensitive / Balanced / Conservative HR-drop thresholds to match your physiology.</p></div>
+    <div class="feat" data-reveal style="--rd:2"><h3>📊 Live telemetry</h3><p>HR, baseline, motion, streak and analysis age right on the watch face — see it working.</p></div>
+    <div class="feat" data-reveal style="--rd:3"><h3>🛡️ Fallback tier</h3><p>OS sleep classification backs up the HR engine on all supported watches.</p></div>
   </div>
 </section>
 
 <section class="wrap" id="watches">
-  <h2>Supported watches</h2>
-  <div class="table-scroll">
+  <h2 data-reveal>Supported watches</h2>
+  <div class="table-scroll" data-reveal style="--rd:1">
   <table>
     <tr><th>Platform</th><th>Watch</th><th>Detection</th></tr>
     <tr><td class="mono">emery</td><td><b>Pebble Time 2</b> <span class="muted">(primary target)</span></td><td class="ok">Tier 1 (HR + motion) + Tier 2</td></tr>
@@ -363,8 +438,8 @@
 </section>
 
 <section class="wrap" id="install">
-  <h2>Build &amp; install</h2>
-  <pre><span class="c"># one-time: pebble-tool needs Python 3.11</span>
+  <h2 data-reveal>Build &amp; install</h2>
+  <pre data-reveal style="--rd:1"><span class="c"># one-time: pebble-tool needs Python 3.11</span>
 uv venv ~/.pebble-venv --python 3.11
 ~/.pebble-venv/bin/pip install pebble-tool
 ~/.pebble-venv/bin/pebble sdk install latest
@@ -393,5 +468,22 @@ cd nap-buster
   </div>
 </footer>
 
+<script>
+(function () {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var els = document.querySelectorAll('[data-reveal]');
+  if (!('IntersectionObserver' in window) || !els.length) return;
+  document.documentElement.classList.add('motion');
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('in');
+        io.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: '0px 0px -36px 0px' });
+  els.forEach(function (el) { io.observe(el); });
+})();
+</script>
 </body>
 </html>
