@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v2.0.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v2.2.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -69,7 +69,7 @@ Previous versions used `accel_service_peek()` (single instantaneous acceleromete
 - **Much more stable** — a minute aggregate vs. a single noisy snapshot
 - **Properly calibrated** — 0–100 = very still, 100–500 = light movement, 500+ = active
 
-**Battery:** outside the guard window Tier 1 piggybacks on HR samples the OS was already taking (zero extra cost). *Inside* the window the worker requests a 120-second HR sample period — this is NapBuster's one real battery spend, and it's what makes near-minute-level detection possible. The boost is cancelled the moment the window closes, on settings changes that close it, and on worker shutdown.
+**Battery:** HealthService is now subscribed only during the guard window plus a 2-hour lead-in before it opens (to warm the baseline) — not 24/7. The 5-minute fallback timer only runs while that subscription is active, so it no longer wakes the CPU every 5 minutes all day. Inside the window the worker also requests a 120-second HR sample period — this is NapBuster's one real battery spend, and it's what makes near-minute-level detection possible. The boost is cancelled the moment the window closes, on settings changes that close it, and on worker shutdown.
 
 ---
 
@@ -79,6 +79,8 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **2.2.0** | Battery: HealthService is no longer subscribed 24/7 on HR-capable platforms — it now subscribes only during the guard window plus a 2-hour lead-in beforehand (`WARM_LEAD_HOURS`), so the awake baseline is still warm by the time guarding starts. The 5-minute fallback timer only runs while that subscription is active, instead of waking the CPU every 5 minutes all day regardless of the window. |
+| **2.1.0** | Raised HR-drop thresholds (Sensitive 8%→10%, Balanced 13%→16%, Conservative 20%→24%) to reduce false "doze" triggers from ordinary resting relaxation (sitting/lying still, vagal tone alone can drop HR 10-15%). Added SELECT-to-cancel-snooze: pressing SELECT while SNOOZED now cancels the snooze and resumes guarding immediately instead of waiting it out. |
 | **2.0.0** | Cadence tuned to 2-minute HR sampling (was 60 s) — halves the in-window battery spend from v1.8.0 while keeping detection latency effectively unchanged, since the two-stage wake thresholds are time-based, not sample-count-based. Detection overhaul carried over from v1.8.0: worker owns the HR cadence (`health_service_set_heart_rate_sample_period`); missing HR/VMC data now freezes the streak instead of resetting it (stale `peek` returns 0 — this was silently zeroing the streak mid-nap); two-stage wake is time-based (nudge ≥4 min sustained, alarm ≥10 min) instead of raw event counts; asymmetric baseline updates (up always unless exercising, down only with awake-zone movement) with guarded seeding and 40–120 clamp; dismiss now actually notifies the worker + 10-min re-fire cooldown; out-of-window HR subscription no longer torn down after 60 s (warm baseline for real); HR capability probe self-heals; nudge cooldown (10 min); debug line shows analysis age |
 | **1.8.0** | Detection overhaul — fixes "never fires" and "nudge spam": worker owns the HR cadence (60 s sample period inside the window via `health_service_set_heart_rate_sample_period`); missing HR/VMC data now freezes the streak instead of resetting it (stale `peek` returns 0 — this was silently zeroing the streak mid-nap); two-stage wake is time-based (nudge ≥4 min sustained, alarm ≥10 min) instead of raw event counts; asymmetric baseline updates (up always unless exercising, down only with awake-zone movement) with guarded seeding and 40–120 clamp; dismiss now actually notifies the worker + 10-min re-fire cooldown; out-of-window HR subscription no longer torn down after 60 s (warm baseline for real); HR capability probe self-heals; nudge cooldown (10 min); debug line shows analysis age |
 | **1.7.0** | Two-stage wake: x1 streak fires a quiet double-pulse nudge; x2 streak fires the full repeating alarm |
@@ -104,7 +106,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 - 💪 **Vibration strength** — Gentle / Medium / Strong
 - 🎛️ **Detection sensitivity** — tune the HR drop threshold to your physiology
 - 📊 **Live debug telemetry** — GUARDING screen shows real-time HR, baseline, VMC, streak, analysis age
-- 🔋 **Battery-aware** — sensors idle outside the window; boosted HR sampling runs only while guarding
+- 🔋 **Battery-aware** — HealthService only subscribes during the guard window plus a 2h lead-in beforehand; fully idle the rest of the day. Boosted HR sampling runs only while guarding
 
 ---
 
@@ -274,7 +276,7 @@ nap-buster/
 
 **Anchored awake HR baseline, not a rolling average.** A rolling average chases HR downward during a gradual nap onset and never crosses the threshold. The anchored baseline updates upward freely (unless exercising, which would inflate it) and downward only with awake-zone movement (VMC ≥ 50) — so it converges to your true resting HR but can't follow a doze down. Seeding requires movement evidence; values are clamped to 40–120 BPM.
 
-**HR buffer always warm** — on HR-capable platforms the health subscription and fallback timer run permanently (piggybacked events cost nothing), so the baseline is real at the moment the window opens. `prv_try_launch_foreground()` guards against out-of-window firing, so collecting data outside is safe — and a nap already in progress when the window opens alarms within minutes.
+**HR buffer warm at window open** — on HR-capable platforms the health subscription and fallback timer now start 2 hours before the guard window opens (not 24/7), so the baseline is already real by the time guarding actually starts, without burning battery the rest of the day. `prv_try_launch_foreground()` guards against out-of-window firing, so collecting data during the lead-in is safe — and a nap already in progress when the window opens alarms within minutes.
 
 **`common.h` is the single source of truth** for all persist keys, default values, vibration patterns, and `is_in_no_nap_window()`. Worker has its own copies of keys it needs (can't include `common.h`).
 

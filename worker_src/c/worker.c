@@ -38,9 +38,12 @@
  *   classified at all). On basalt/chalk this is the only tier.
  *
  * Lifecycle:
- *   HR-capable  → HealthService ALWAYS subscribed (piggybacked events keep the
- *                 awake baseline warm), 5-min fallback timer always armed.
- *                 HR boost only inside the window.
+ *   HR-capable  → HealthService subscribed during the guard window AND for a
+ *                 WARM_LEAD_HOURS (2h) lead-in beforehand, so the awake
+ *                 baseline is warm the moment guarding starts. Fully
+ *                 unsubscribed the rest of the day — no more 24/7 always-on
+ *                 subscription. 5-min fallback timer only runs while
+ *                 subscribed. HR boost only inside the window itself.
  *   non-HR      → HealthService subscribed only inside the window (Tier 2).
  *   A 60-second timer drives window-boundary transitions either way.
  *
@@ -113,6 +116,7 @@
 #define BASELINE_MIN_BPM      40      // sanity clamp for the awake baseline
 #define BASELINE_MAX_BPM      120
 #define HR_BOOST_PERIOD_SECS  120     // in-window HR sample period request
+#define WARM_LEAD_HOURS       2       // subscribe/analyze this long before window open too
 
 // Two-stage wake: counts AND sustained time both required (cadence-independent)
 #define NUDGE_MIN_COUNT       2
@@ -228,6 +232,34 @@ static bool prv_is_in_window(void) {
         return (hour >= start && hour < end);
     } else {
         return (hour >= start || hour < end);
+    }
+}
+
+/**
+ * True during the WARM_LEAD_HOURS window immediately before the guard window
+ * opens, on an active day. Lets HR-capable platforms subscribe/analyze early
+ * so the awake baseline is already warm the moment guarding actually starts,
+ * without needing a 24/7 subscription the rest of the day.
+ */
+static bool prv_is_in_lead_period(void) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+
+    uint8_t active_days = persist_exists(PERSIST_KEY_ACTIVE_DAYS)
+        ? (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS)
+        : DEFAULT_ACTIVE_DAYS;
+    active_days &= 0x7F;
+    if (active_days == 0) active_days = DEFAULT_ACTIVE_DAYS;
+    if (!((active_days >> t->tm_wday) & 1)) return false;
+
+    int hour       = t->tm_hour;
+    int start      = prv_get_start_hour();
+    int lead_start = ((start - WARM_LEAD_HOURS) % 24 + 24) % 24;
+
+    if (lead_start <= start) {
+        return (hour >= lead_start && hour < start);
+    } else {
+        return (hour >= lead_start || hour < start);
     }
 }
 
@@ -566,10 +598,10 @@ static void prv_stop_sample_timer(void) {
 }
 
 /**
- * Fallback timer — fires every 5 minutes while the worker runs (HR platforms).
+ * Fallback timer — fires every 5 minutes while subscribed (guard window or
+ * the WARM_LEAD_HOURS lead-in), stopped entirely the rest of the day.
  * Skips entirely if a HealthEventHeartRateUpdate ran analysis recently, which
- * inside the window (boosted 120 s events) is essentially always. Outside the
- * window it keeps the awake baseline warm between sparse OS samples.
+ * inside the window (boosted 120 s events) is essentially always.
  * peek_current_value returns 0 for samples older than 15 min — a zero here
  * just skips the cycle, it no longer resets detection state.
  */
@@ -604,27 +636,33 @@ static void prv_sample_timer_callback(void *ctx) {
  * state. Called at init, on every 60 s boundary tick, and on settings changes.
  */
 static void prv_apply_window_state(void) {
-    bool in_window = prv_get_enabled() && prv_is_in_window();
+    bool enabled    = prv_get_enabled();
+    bool in_window  = enabled && prv_is_in_window();
     bool was_active = s_window_active;
     s_window_active = in_window;
 
-    // HR-capable platforms stay subscribed permanently so free piggybacked
-    // events keep the awake baseline warm; Tier-2-only platforms subscribe
-    // just for the window.
-    if (s_hr_capable || in_window) {
+    // Subscribe during the guard window itself, plus a WARM_LEAD_HOURS lead-in
+    // beforehand on HR-capable platforms (so the awake baseline is already
+    // warm the moment guarding starts). Outside both, fully unsubscribe — no
+    // more 24/7 always-on subscription burning battery all day.
+    bool in_lead      = enabled && s_hr_capable && !in_window && prv_is_in_lead_period();
+    bool want_health  = in_window || in_lead;
+
+    if (want_health) {
         prv_subscribe_health();
     } else {
         prv_unsubscribe_health();
     }
 
-    // Fallback timer mirrors HR capability, not the window
-    if (s_hr_capable) {
+    // Fallback timer only needed while actually subscribed for Tier 1
+    // (window or lead-in) — no reason to wake every 5 min the rest of the day.
+    if (s_hr_capable && want_health) {
         prv_start_sample_timer();
     } else {
         prv_stop_sample_timer();
     }
 
-    // Boosted 120 s HR sampling only while guarding
+    // Boosted 120 s HR sampling only while actually guarding
     prv_set_hr_boost(in_window);
 
     if (in_window && !was_active) {
