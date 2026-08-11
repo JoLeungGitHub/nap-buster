@@ -1,3 +1,6 @@
 build/
 .waf*
 .lock-waf*
+
+# Local wrangler cache (account info) — deploys run in CI
+.wrangler/
