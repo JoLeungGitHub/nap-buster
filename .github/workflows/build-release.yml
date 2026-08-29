@@ -1,0 +1,81 @@
+name: Build & Release
+
+# Builds the NapBuster .pbw with the rePebble SDK and, on version tags,
+# publishes it as a GitHub Release asset. The .pbw bundles every target
+# platform (emery/diorite/basalt/chalk) in one file.
+#
+# - workflow_dispatch: build-only smoke run, uploads the .pbw as a workflow
+#   artifact (used to validate the toolchain without cutting a release)
+# - push of a v* tag: build + create the GitHub Release with the .pbw attached
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create releases / upload assets
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pebble-tool
+        run: pip install pebble-tool
+
+      # The SDK download (ARM toolchain + QEMU) is large — cache it between
+      # runs. Keyed coarsely on purpose: `pebble sdk install latest` below
+      # re-runs only when the cache is cold.
+      - name: Cache Pebble SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pebble-sdk
+          key: pebble-sdk-${{ runner.os }}-v1
+
+      - name: Install Pebble SDK (skip if restored from cache)
+        run: |
+          if pebble sdk list 2>/dev/null | grep -q "(active)"; then
+            echo "Pebble SDK restored from cache:"
+            pebble sdk list | head -3
+          else
+            pebble sdk install latest
+          fi
+
+      - name: Build
+        run: pebble build
+
+      - name: Assert artifact
+        run: |
+          test -f build/napbuster.pbw
+          ls -la build/*.pbw
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: napbuster-pbw
+          path: build/napbuster.pbw
+          if-no-files-found: error
+
+      # Tag builds publish a release. Notes are auto-generated from PRs as a
+      # baseline; they get curated by hand after publishing.
+      - name: Create GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/napbuster.pbw "napbuster-${GITHUB_REF_NAME}.pbw"
+          gh release create "$GITHUB_REF_NAME" "napbuster-${GITHUB_REF_NAME}.pbw" \
+            --title "NapBuster $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
