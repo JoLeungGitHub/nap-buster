@@ -29,6 +29,8 @@
 #define PERSIST_KEY_LAST_DISMISS     21  // time_t: last alarm dismissal (worker cooldown gate)
 #define PERSIST_KEY_STREAK_START     22  // time_t: worker-internal — start of current streak
 #define PERSIST_KEY_DEBUG_LAST_TS    23  // time_t: when the worker last completed an analysis
+#define PERSIST_KEY_HRV_BASELINE     24  // int16: anchored awake PPI-spread baseline (ms)
+#define PERSIST_KEY_DEBUG_HRV        25  // int: last PPI spread (ms), -1 = unavailable
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1

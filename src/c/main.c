@@ -356,7 +356,7 @@ static void update_home_screen(void) {
     layer_mark_dirty(s_state_bar);
 
     // ── Debug telemetry display (GUARDING state only) ──
-    static char debug_buf[40];
+    static char debug_buf[48];
     if (state == HOME_STATE_GUARDING) {
         int16_t dbg_hr  = persist_exists(PERSIST_KEY_DEBUG_HR)
                           ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_HR) : 0;
@@ -368,6 +368,10 @@ static void update_home_screen(void) {
                           ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
         int32_t last_ts = persist_exists(PERSIST_KEY_DEBUG_LAST_TS)
                           ? persist_read_int(PERSIST_KEY_DEBUG_LAST_TS) : 0;
+        int32_t dbg_hrv = persist_exists(PERSIST_KEY_DEBUG_HRV)
+                          ? persist_read_int(PERSIST_KEY_DEBUG_HRV) : -1;
+        int16_t hrv_base = persist_exists(PERSIST_KEY_HRV_BASELINE)
+                          ? (int16_t)persist_read_int(PERSIST_KEY_HRV_BASELINE) : 0;
         if (dbg_hr > 0) {
             // Age of the last completed analysis — the quickest way to see on
             // the watch whether detection is actually running.
@@ -376,15 +380,21 @@ static void update_home_screen(void) {
                 time_t now = time(NULL);
                 if (now >= (time_t)last_ts) age_min = (int)((now - last_ts) / 60);
             }
+            char age_str[8] = "";
             if (age_min >= 0 && age_min < 100) {
+                snprintf(age_str, sizeof(age_str), " %dm", age_min);
+            }
+            if (dbg_hrv >= 0) {
+                // HRV mode: current/baseline pairs — "HR:64/71 h:42/28 v:38 x2 0m"
                 snprintf(debug_buf, sizeof(debug_buf),
-                         "HR:%d base:%d vmc:%d x%d %dm",
-                         (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak,
-                         age_min);
+                         "HR:%d/%d h:%ld/%d v:%ld x%d%s",
+                         (int)dbg_hr, (int)dbg_avg, (long)dbg_hrv, (int)hrv_base,
+                         (long)dbg_acc, (int)streak, age_str);
             } else {
                 snprintf(debug_buf, sizeof(debug_buf),
-                         "HR:%d base:%d vmc:%d x%d",
-                         (int)dbg_hr, (int)dbg_avg, (int)dbg_acc, (int)streak);
+                         "HR:%d base:%d vmc:%ld x%d%s",
+                         (int)dbg_hr, (int)dbg_avg, (long)dbg_acc, (int)streak,
+                         age_str);
             }
         } else {
             snprintf(debug_buf, sizeof(debug_buf), "HR: warming up...");
