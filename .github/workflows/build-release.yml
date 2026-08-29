@@ -55,16 +55,20 @@ jobs:
       - name: Build
         run: pebble build
 
+      # pebble-tool names the bundle after the project directory
+      # (build/nap-buster.pbw), so resolve it by glob rather than hardcoding.
       - name: Assert artifact
         run: |
-          test -f build/napbuster.pbw
           ls -la build/*.pbw
+          PBW=$(ls build/*.pbw | head -1)
+          test -f "$PBW"
+          echo "PBW=$PBW" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: napbuster-pbw
-          path: build/napbuster.pbw
+          path: build/*.pbw
           if-no-files-found: error
 
       # Tag builds publish a release. Notes are auto-generated from PRs as a
@@ -74,7 +78,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp build/napbuster.pbw "napbuster-${GITHUB_REF_NAME}.pbw"
+          cp "$PBW" "napbuster-${GITHUB_REF_NAME}.pbw"
           gh release create "$GITHUB_REF_NAME" "napbuster-${GITHUB_REF_NAME}.pbw" \
             --title "NapBuster $GITHUB_REF_NAME" \
             --generate-notes \

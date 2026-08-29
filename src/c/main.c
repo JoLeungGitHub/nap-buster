@@ -356,7 +356,8 @@ static void update_home_screen(void) {
     layer_mark_dirty(s_state_bar);
 
     // ── Debug telemetry display (GUARDING state only) ──
-    static char debug_buf[48];
+    // 64 bytes covers the compiler-computed worst case of the HRV format
+    static char debug_buf[64];
     if (state == HOME_STATE_GUARDING) {
         int16_t dbg_hr  = persist_exists(PERSIST_KEY_DEBUG_HR)
                           ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_HR) : 0;

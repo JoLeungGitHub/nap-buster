@@ -252,7 +252,7 @@ cd nap-buster
 ~/.pebble-venv/bin/pebble build
 ```
 
-Output: `build/napbuster.pbw`
+Output: `build/nap-buster.pbw`
 
 ### Install to emulator
 
