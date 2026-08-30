@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v2.3.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v2.4.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -19,10 +19,12 @@ Background worker (always running)
     │   sample periods (they share one sensor subscription — no extra wakeups)
     │   (outside the window it rides the OS's own ~10-min samples for free)
     │       └──▶ read current HR BPM
-    │            read HRV peak-to-peak intervals (artifact-gated → "PPI spread")
+    │            read HRV peak-to-peak intervals (artifact-gated, grouped into
+    │              sensor bursts → inter-burst "drift spread")
     │            read HealthMinuteData.vmc (pre-computed motion intensity)
     │            run analysis:
-    │               EARLY PATH: PPI spread ≥ M% above awake baseline (HRV rise)
+    │               EARLY PATH: drift spread ≤ M% of awake baseline (average
+    │                           HR gone metronomic — the doze-off signature)
     │                           AND smoothed HR mildly below baseline
     │               INSURANCE:  smoothed HR dropped >N% below awake baseline
     │               Either path AND VMC below 100? (very still)
@@ -45,14 +47,16 @@ Background worker (always running)
                            └─ DOWN   ──▶ snooze 30 min
 ```
 
-### Why HRV is the primary signal (v2.3.0)
+### Why drift suppression is the primary signal (v2.4.0)
 
-As you fall asleep, your autonomic nervous system shifts from sympathetic to parasympathetic dominance — **HRV rises and HR falls, together**. The HRV rise is the earlier and more specific half of that signature: plain quiet rest can drop HR 10–15% through vagal tone alone (the false-positive plague of HR-only detection), but a *simultaneous* sustained HRV rise is much more specific to actually drifting off.
+Textbook HRV (rMSSD over adjacent heartbeats) rises at sleep onset. But what this hardware actually hands an app is different: the Pebble Time 2's Goodix sensor reports **up to 4 adjacent-beat RR intervals per sensor burst** (one `HealthEventHRVUpdate` each, no firmware quality filtering), and bursts arrive one sample period (~2 min) apart. A variability statistic over those readings is dominated by the **inter-burst term** — how far your average HR wandered between bursts — not by respiratory beat-to-beat variability.
 
-PebbleOS 4.33 exposes HRV as raw **peak-to-peak intervals** (PPI, ms between heartbeats) via `HealthEventHRVUpdate` — one reading per sensor burst, with no firmware quality filtering. NapBuster artifact-gates each PPI (physiological range 300–2000 ms, and within ±40% of the interval implied by the current HR) and keeps a ring of the last 8 accepted readings. The **mean absolute successive difference** over that ring — the *PPI spread* — is its RMSSD-like variability proxy at the 2-minute sample cadence.
+And that inter-burst *drift* turns out to be a beautiful sleep signal, just inverted from textbook HRV: awake, your average HR wanders constantly (posture, cognition, micro-arousals — measured ~140–165 ms of drift on real wrists); as you doze, your heart goes metronomic and drift **collapses** (~30 ms, appearing *before* full sleep). v2.3.0 coded the textbook direction and its HRV path never fired; v2.4.0 measures what the sensor actually delivers.
+
+Pipeline: each PPI is artifact-gated (physiological range 300–2000 ms, within ±40% of the HR-implied interval), readings ≤10 s apart are grouped into a burst, each burst reduces to its **mean PPI**, and the ring of the last 8 burst means yields the **drift spread** (mean absolute successive difference). Within-burst adjacent-beat variability — the true rMSSD material, expected to rise in sleep — is computed and logged per burst as a future second signal, but doesn't gate yet.
 
 Detection then runs two paths, both gated on stillness:
-- **Early path (HRV-primary):** PPI spread ≥ 25–60% above your awake-spread baseline (per sensitivity) **and** smoothed HR mildly below baseline (roughly half the full drop). Fires earlier because the HR dip requirement is halved when HRV corroborates.
+- **Early path (HRV-primary):** drift spread ≤ 60/50/40% of your awake-drift baseline (Sensitive/Balanced/Conservative) **and** smoothed HR mildly below baseline (roughly half the full drop). Fires early in the doze-off slide, when the HR drop is still shallow.
 - **Insurance path:** the v2.x full HR drop (10–24% per sensitivity). Keeps working when HRV data is missing, rejected as artifacts, or the hardware doesn't support it.
 
 **VMC (Vector Magnitude Count)** remains the noise filter for both paths: even if the vitals say "sleepy", movement means you weren't napping. HRV needs a quiet wrist anyway — optical PPI during motion is garbage, which the artifact gate and stillness requirement handle together.
@@ -73,15 +77,15 @@ The baseline is only **seeded** when VMC ≥ 50 (never from a reading taken whil
 
 A 3-sample smoothing buffer on the current HR reading reduces single-sample noise before the comparison is made. At the boosted 120-second cadence that's a ~6-minute smoothing horizon.
 
-### Anchored awake-spread (HRV) baseline
+### Anchored awake-drift (HRV) baseline
 
-The PPI-spread baseline uses the same anchoring philosophy, **inverted** — sleep onset *raises* spread, so upward is the dangerous direction:
+The drift baseline uses the same anchoring philosophy as the HR one — with **down** as the dangerous direction, since sleep *lowers* drift:
 
-- spread **falling** → baseline updates downward freely (falling variability never mimics sleep)
-- spread **rising** → baseline updates upward only while HR proves wakefulness (smoothed HR ≥ 95% of the HR baseline) with a reasonably quiet wrist (VMC < 200)
-- seeded only under those same clearly-awake conditions; clamped to 5–200 ms
+- drift **rising** → baseline updates upward whenever the wrist is quiet (VMC < 200) — rising drift is itself wakefulness evidence, but motion-garbage PPIs must not inflate the anchor
+- drift **falling** → baseline updates downward only while HR proves wakefulness (smoothed HR ≥ 95% of the HR baseline, quiet wrist)
+- seeded only under those clearly-awake conditions; clamped to 5–200 ms
 
-So when your variability climbs as you drift off, the baseline stays anchored to your awake value and the gap becomes the trigger.
+v2.3.0 had this asymmetry mirrored (free downward updates), and the baseline demonstrably chased its user into a doze — 163 ms awake → 35 ms while drowsy — which crippled the trigger margin. With the corrected anchor, dozing at ~30 ms against a ~160 ms awake baseline sits at ~19%, far beyond even the Conservative threshold.
 
 ### VMC vs. raw accelerometer
 
@@ -100,6 +104,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **2.4.0** | HRV direction fix, grounded in the sensor's actual behavior (the Goodix driver delivers up to 4 adjacent-beat RRs per burst, one event each — undocumented; verified in PebbleOS source): PPIs are now grouped into bursts and reduced to burst-mean PPIs, so the ring measures pure **inter-burst drift**, which on-wrist data shows is ~140–165 ms awake and collapses to ~30 ms while dozing — the *opposite* of v2.3.0's assumed rMSSD rise. Trigger flipped to drift **suppression** (≤60/50/40% of awake baseline per sensitivity) + the half-strength HR dip; baseline anchoring mirrored (down-moves now need proof of wakefulness — v2.3.0's free-down anchor chased the user into their doze, 163→35 ms); up-moves require a quiet wrist so motion garbage can't inflate the anchor. Within-burst adjacent-beat variability (true rMSSD) is logged per burst as a candidate future signal. A contaminated v2.3.0 baseline self-heals upward within ~25 min of quiet wakefulness |
 | **2.3.0** | HRV-primary detection (SDK 4.33 APIs, Pebble Time 2): worker requests an HRV sample period alongside the HR period (shared sensor subscription at the same 120 s — zero extra sensor wakeups); each `HealthEventHRVUpdate` PPI is artifact-gated (300–2000 ms + ±40% of HR-implied interval, since firmware forwards readings unfiltered) into an 8-sample ring; "PPI spread" (mean abs successive difference) vs an inverted-anchored awake-spread baseline adds an early trigger path — spread ≥ 25/40/60% above baseline (per sensitivity) + a *half*-strength HR dip; the full HR-drop path stays as insurance and is the sole path on Pebble 2 / firmware <4.33. Debug line shows `h:spread/base` in HRV mode. Requires PebbleOS ≥ 4.33 |
 | **2.2.0** | Battery: HealthService is no longer subscribed 24/7 on HR-capable platforms — it now subscribes only during the guard window plus a 2-hour lead-in beforehand (`WARM_LEAD_HOURS`), so the awake baseline is still warm by the time guarding starts. The 5-minute fallback timer only runs while that subscription is active, instead of waking the CPU every 5 minutes all day regardless of the window. |
 | **2.1.0** | Raised HR-drop thresholds (Sensitive 8%→10%, Balanced 13%→16%, Conservative 20%→24%) to reduce false "doze" triggers from ordinary resting relaxation (sitting/lying still, vagal tone alone can drop HR 10-15%). Added SELECT-to-cancel-snooze: pressing SELECT while SNOOZED now cancels the snooze and resumes guarding immediately instead of waiting it out. |
@@ -119,7 +124,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 ## Features
 
 - 🔬 **Early nap detection** — HRV + HR + VMC at a 2-minute cadence catches nap onset in ~5–10 min (Pebble Time 2; HR + VMC on Pebble 2)
-- 💓 **HRV-primary triggering** — rising beat-to-beat variability (the physiological front edge of sleep onset) fires with only a mild HR dip; the full HR-drop path remains as insurance
+- 💓 **HRV-primary triggering** — collapsing heart-rate drift (your pulse going metronomic is the front edge of the doze-off slide) fires with only a mild HR dip; the full HR-drop path remains as insurance
 - 🔔 **Two-stage wake** — quiet double-pulse nudge after ~4 min of sustained evidence; full repeating alarm at ~10 min if you don't stir
 - 🛡️ **Fallback detection** — Pebble's native sleep confirmation as a safety net on all platforms
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed
@@ -178,27 +183,27 @@ The settings row shows a smart summary: `Every day`, `Weekdays`, `Weekends`, or 
 
 ## Debug telemetry
 
-When in GUARDING state, the home screen shows a live readout. In HRV mode (Pebble Time 2, once the spread window is warm):
+When in GUARDING state, the home screen shows a live readout. In HRV mode (Pebble Time 2, once enough bursts are collected):
 
 ```
-HR:64/71 h:42/28 v:38 x2 0m
+HR:64/71 h:145/160 v:38 x0 0m
 ```
 
 | Field | Meaning |
 |---|---|
 | `HR:64/71` | Smoothed heart rate / anchored awake HR baseline (BPM) |
-| `h:42/28` | Current PPI spread / anchored awake-spread baseline (ms) — the HRV signal |
+| `h:145/160` | Current drift spread / anchored awake-drift baseline (ms) — the HRV signal. Awake it sits high (~140–165); **it collapsing toward ~30 means you're drifting off** |
 | `v:38` | Vector Magnitude Count — motion intensity this minute (0–100 = still, 500+ = active) |
-| `x2` | Consecutive positive-cycle streak |
+| `x0` | Consecutive positive-cycle streak |
 | `0m` | Minutes since the worker last completed an analysis cycle |
 
-Before HRV is warm (fewer than 5 accepted PPIs, or unsupported hardware), the line falls back to the HR-only format `HR:68 base:74 vmc:42 x1 2m`.
+Before HRV is warm (fewer than 5 completed bursts, or unsupported hardware), the line falls back to the HR-only format `HR:68 base:74 vmc:42 x1 2m`.
 
 **The age field is the first thing to check.** While guarding it should read `0m`–`2m` (boosted 120 s cadence). If it keeps climbing, no analysis is running — HR data isn't reaching the worker (Pebble Health or HR disabled in the mobile app, or the watch rejected the sample-period request).
 
 **Tuning guide:**
-- If it false-triggers: check `v:` when it fires. If VMC is high, you were moving — VMC threshold may need raising. If it fired on the HRV path (`h:` current well above baseline), try **Conservative** sensitivity (raises both the spread-rise and HR-drop requirements) or raise `ALARM_AFTER_SECS` in `worker.c`.
-- If it misses naps: watch `h:` while drowsy. If the spread doesn't climb (or the line stays in HR-only format), the HRV window may be starved by artifact rejection — the HR insurance path still applies, so also consider **Sensitive**. If VMC is high during naps (restless sleeper), the VMC gate may be too aggressive — though since v1.8.0 a single restless minute no longer resets the streak (the VMC trend has to rise too).
+- If it false-triggers: check `v:` when it fires. If VMC is high, you were moving — VMC threshold may need raising. If it fired on the HRV path (`h:` current far below baseline while you were awake — e.g. calmly reading), try **Conservative** sensitivity (tightens both the drift-suppression and HR-drop requirements) or raise `ALARM_AFTER_SECS` in `worker.c`.
+- If it misses naps: watch `h:` while drowsy — the current value should sink well below half the baseline. If the baseline itself looks too low (e.g. `h:30/40` while dozing), it hasn't recovered from quiet time yet; it rises again with normal awake activity. If the line stays in HR-only format, the burst window may be starved by artifact rejection — the HR insurance path still applies, so also consider **Sensitive**. If VMC is high during naps (restless sleeper), the VMC gate may be too aggressive — though since v1.8.0 a single restless minute no longer resets the streak (the VMC trend has to rise too).
 
 ---
 
@@ -338,8 +343,8 @@ nap-buster/
 | `21` | `LAST_DISMISS` | time_t | Last alarm dismissal — worker re-fire cooldown |
 | `22` | `STREAK_START` | time_t | Start of the current positive-cycle streak |
 | `23` | `DEBUG_LAST_TS` | time_t | When the worker last completed an analysis |
-| `24` | `HRV_BASELINE` | int16 | Anchored awake PPI-spread baseline (ms) |
-| `25` | `DEBUG_HRV` | int | Last PPI spread (ms), −1 = unavailable |
+| `24` | `HRV_BASELINE` | int16 | Anchored awake drift baseline (ms) |
+| `25` | `DEBUG_HRV` | int | Last drift spread (ms), −1 = unavailable |
 
 ---
 

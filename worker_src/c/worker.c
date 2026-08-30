@@ -1,5 +1,5 @@
 /**
- * worker.c — NapBuster Background Worker v7
+ * worker.c — NapBuster Background Worker v8
  *
  * Two-tier sleep detection:
  *
@@ -16,20 +16,26 @@
  *   HRV (SDK 4.33+, Pebble Time 2 hardware): alongside the HR period the
  *   worker requests an HRV sample period at the SAME 120 s interval — the two
  *   share one sensor subscription driven at the shorter period, so this adds
- *   no sensor wakeups over v2.2. Each HealthEventHRVUpdate delivers one raw
- *   peak-to-peak interval (PPI, ms); the firmware does NO quality filtering,
- *   so we artifact-gate each PPI (physiological range + agreement with the
- *   current HR) and keep a small ring of accepted samples. The mean absolute
- *   successive difference over that ring ("PPI spread") is our HRV proxy:
- *   at sleep onset parasympathetic tone rises, so spread RISES while HR
- *   falls. Detection becomes HRV-primary where available:
- *     positive = still AND (spread elevated AND HR mildly low)   ← early path
+ *   no sensor wakeups over v2.2. The Goodix driver reports up to 4
+ *   adjacent-beat RR intervals per sensor burst, one HealthEventHRVUpdate
+ *   each, with NO firmware quality filtering — so we artifact-gate each PPI
+ *   (physiological range + agreement with current HR), group readings into
+ *   bursts (≤ BURST_GAP_SECS apart), and keep a ring of burst-mean PPIs.
+ *   The mean absolute successive difference over that ring ("drift spread")
+ *   measures how much average HR wanders between bursts — HIGH while awake
+ *   (on-wrist: ~140-165 ms), COLLAPSING as the user dozes (~30 ms). v2.3.0
+ *   assumed textbook rMSSD behavior (variability rises at sleep onset) and
+ *   had this inverted; the drift term dominates at a 2-minute cadence and
+ *   moves the other way. Detection is HRV-primary where available:
+ *     positive = still AND (drift suppressed AND HR mildly low)  ← early path
  *                       OR (HR fully dropped)                    ← v2.2 path
- *   The awake-spread baseline is anchored the same way as the HR baseline,
- *   but inverted: UP-moves are the dangerous direction (sleep raises spread),
- *   so it only rises while HR proves wakefulness; it falls freely. On
- *   watches without HRV (Pebble 2, or firmware <4.33) the request fails and
- *   detection is exactly the v2.2 HR-only behavior.
+ *   The awake-drift baseline anchors with DOWN as the dangerous direction:
+ *   it only falls while HR proves wakefulness, and rises only with a quiet
+ *   wrist (motion garbage must not inflate it). Within-burst adjacent-beat
+ *   variability (true rMSSD material, expected to RISE in sleep) is computed
+ *   and logged per burst for future validation, but does not yet gate.
+ *   On watches without HRV (Pebble 2, or firmware <4.33) the request fails
+ *   and detection is exactly the v2.2 HR-only behavior.
  *
  *   Each analysis cycle needs BOTH a valid HR reading and a valid VMC minute
  *   record. Missing data FREEZES the detection state (skip cycle) — it never
@@ -106,8 +112,8 @@
 #define PERSIST_KEY_LAST_DISMISS      21  // time_t: last alarm dismissal (written by foreground)
 #define PERSIST_KEY_STREAK_START      22  // time_t: first positive cycle of current streak
 #define PERSIST_KEY_DEBUG_LAST_TS     23  // time_t: when the last analysis cycle completed
-#define PERSIST_KEY_HRV_BASELINE      24  // int16: anchored awake PPI-spread baseline (ms)
-#define PERSIST_KEY_DEBUG_HRV         25  // int: last PPI spread (ms), -1 = unavailable
+#define PERSIST_KEY_HRV_BASELINE      24  // int16: anchored awake drift baseline (ms)
+#define PERSIST_KEY_DEBUG_HRV         25  // int: last drift spread (ms), -1 = unavailable
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -142,6 +148,7 @@
 // HRV shares the HR sensor subscription (driven at the shorter period), so an
 // equal period means the sensor fires no more often than the HR boost alone.
 #define HRV_PERIOD_SECS       120     // in-window HRV sample period request
+#define BURST_GAP_SECS        10      // PPIs closer together than this = one sensor burst
 #define HRV_BUF_SIZE          8       // accepted-PPI ring (~16 min at 120 s)
 #define HRV_MIN_SAMPLES       5       // spread needs at least this many PPIs
 #define HRV_STALE_SECS        900     // ring unusable if newest PPI older than this
@@ -224,15 +231,28 @@ static bool     s_hrv_boosted = false;
 // restart, which is when a firmware update could have changed the answer.
 static bool     s_hrv_rejected = false;
 
-// Ring of accepted (artifact-gated) PPI readings, ms
-static uint16_t s_ppi_buf[HRV_BUF_SIZE];
-static uint8_t  s_ppi_idx   = 0;
-static uint8_t  s_ppi_count = 0;
-static time_t   s_last_ppi_time = 0;
+// The Goodix driver reports up to 4 adjacent-beat RR intervals per sensor
+// burst, each as its own HealthEventHRVUpdate. Accepted PPIs are accumulated
+// per burst; the ring stores one MEAN PPI per completed burst, so the spread
+// over the ring is a pure inter-burst drift metric (how much average HR
+// wanders between samples) — high awake, collapsing during sleep.
+static uint16_t s_burst_buf[HRV_BUF_SIZE];   // burst-mean PPIs, ms
+static uint8_t  s_burst_idx   = 0;
+static uint8_t  s_burst_count = 0;
+static time_t   s_last_burst_time = 0;
 
-// Anchored awake PPI-spread baseline (ms). Inverse of the HR baseline: sleep
-// onset RAISES spread, so up-moves are gated on proof of wakefulness and
-// down-moves are free. 0 = not yet established.
+// In-progress burst accumulator (finalized when the next volley starts, or
+// when an analysis cycle finds it older than BURST_GAP_SECS)
+static uint32_t s_cur_burst_sum      = 0;
+static uint8_t  s_cur_burst_n        = 0;
+static time_t   s_cur_burst_start    = 0;
+static uint16_t s_cur_burst_prev_ppi = 0;
+static uint32_t s_cur_burst_rsa_sum  = 0;   // |diff| of adjacent-beat RRs
+static uint8_t  s_cur_burst_rsa_n    = 0;   // (true rMSSD material — logged only)
+
+// Anchored awake drift baseline (ms). Sleep onset LOWERS drift, so down-moves
+// are gated on proof of wakefulness and up-moves need only a quiet wrist
+// (motion-garbage PPIs must not inflate the anchor). 0 = not yet established.
 static int16_t  s_hrv_awake_baseline = 0;
 
 // Last smoothed HR, used to artifact-gate incoming PPIs against the
@@ -277,27 +297,28 @@ static int prv_get_hr_drop_pct(void) {
 
 /**
  * Softer HR threshold used when HRV corroborates: halfway between "no drop"
- * and the full sensitivity drop. HRV rises earlier and harder at sleep onset
- * than HR falls, so with spread elevated we accept a milder HR dip.
- * Sensitive: 95, Balanced: 92, Conservative: 88.
+ * and the full sensitivity drop. Drift suppression appears earlier in the
+ * doze-off slide than a full HR drop, so with drift suppressed we accept a
+ * milder HR dip. Sensitive: 95, Balanced: 92, Conservative: 88.
  */
 static int prv_get_hr_soft_pct(void) {
     return (100 + prv_get_hr_drop_pct()) / 2;
 }
 
 /**
- * Required PPI-spread rise (percent of the awake baseline) for the HRV path.
- * RMSSD-like measures commonly rise 30-60% from quiet wakefulness into stage-1
- * sleep; wrist PPI at a 2-minute cadence is noisier, so thresholds sit high.
+ * Drift-suppression threshold (percent of the awake baseline) for the HRV
+ * path: positive when spread ≤ baseline × pct / 100. On-wrist data (PT2):
+ * quiet-awake drift ≈ 140–165 ms, dozing/napping ≈ 30 ms — sleep stabilizes
+ * average HR, so inter-burst drift collapses. Thresholds leave wide margin.
  */
-static int prv_get_hrv_rise_pct(void) {
+static int prv_get_hrv_suppress_pct(void) {
     int level = persist_exists(PERSIST_KEY_SENSITIVITY)
                 ? persist_read_int(PERSIST_KEY_SENSITIVITY)
                 : DEFAULT_SENSITIVITY;
     switch (level) {
-        case 0: return 125;  // Sensitive:    +25% spread
-        case 2: return 160;  // Conservative: +60% spread
-        default: return 140; // Balanced:     +40% spread
+        case 0: return 60;  // Sensitive:    ≤60% of awake drift
+        case 2: return 40;  // Conservative: ≤40%
+        default: return 50; // Balanced:     ≤50%
     }
 }
 
@@ -513,16 +534,57 @@ static void prv_set_hrv_boost(bool on) {
     }
 }
 
-// ─── HRV: PPI ingest + spread ─────────────────────────────────────────────────
+// ─── HRV: burst-aware PPI ingest + drift spread ──────────────────────────────
+//
+// The Goodix driver delivers up to 4 adjacent-beat RR intervals per sensor
+// burst, one HealthEventHRVUpdate each. Flattening those into a single ring
+// (v2.3.0) mixed two different signals: within-burst variability (respiratory,
+// rises in sleep) and inter-burst HR drift (falls in sleep). The drift term
+// dominates a successive-difference stat, which is why the v2.3.0 "spread"
+// empirically DROPPED during naps. v2.4.0 separates them: each burst reduces
+// to its mean PPI, the ring holds burst means, and the spread over the ring is
+// a clean drift metric. Within-burst variability is logged for future use.
+
+/** Push the completed in-progress burst (if any) into the burst ring. */
+static void prv_finalize_burst(void) {
+    if (s_cur_burst_n == 0) return;
+
+    uint16_t mean = (uint16_t)(s_cur_burst_sum / s_cur_burst_n);
+    s_burst_buf[s_burst_idx] = mean;
+    s_burst_idx = (s_burst_idx + 1) % HRV_BUF_SIZE;
+    if (s_burst_count < HRV_BUF_SIZE) s_burst_count++;
+    s_last_burst_time = time(NULL);
+
+    if (s_cur_burst_rsa_n > 0) {
+        // Adjacent-beat variability inside the burst — true rMSSD material
+        // (rises at sleep onset). Telemetry-only until validated on-wrist.
+        APP_LOG(APP_LOG_LEVEL_INFO,
+            "NapBuster HRV: burst mean=%u ms n=%u rsa=%lu ms (%d bursts)",
+            (unsigned)mean, (unsigned)s_cur_burst_n,
+            (unsigned long)(s_cur_burst_rsa_sum / s_cur_burst_rsa_n),
+            (int)s_burst_count);
+    } else {
+        APP_LOG(APP_LOG_LEVEL_DEBUG,
+            "NapBuster HRV: burst mean=%u ms n=%u (%d bursts)",
+            (unsigned)mean, (unsigned)s_cur_burst_n, (int)s_burst_count);
+    }
+
+    s_cur_burst_sum      = 0;
+    s_cur_burst_n        = 0;
+    s_cur_burst_start    = 0;
+    s_cur_burst_prev_ppi = 0;
+    s_cur_burst_rsa_sum  = 0;
+    s_cur_burst_rsa_n    = 0;
+}
 
 /**
- * Artifact-gate and store one raw PPI reading. The firmware forwards every
- * driver reading with NO quality filtering (quality exists internally but is
- * not exposed), so this gate is our only defense against motion artifacts,
- * poor contact, and off-wrist noise:
+ * Artifact-gate one raw PPI reading and accumulate it into the current burst.
+ * The firmware forwards every driver reading with NO quality filtering
+ * (quality exists internally but is not exposed), so this gate is our only
+ * defense against motion artifacts, poor contact, and off-wrist noise:
  *   1. physiological range 300–2000 ms (30–200 bpm), and
  *   2. within ±PPI_HR_TOLERANCE_PCT of the interval implied by current HR —
- *      wide enough for genuine respiratory variability, tight enough to
+ *      wide enough for genuine beat-to-beat variability, tight enough to
  *      reject sensor garbage.
  */
 static void prv_ingest_ppi(uint16_t ppi_ms) {
@@ -543,35 +605,54 @@ static void prv_ingest_ppi(uint16_t ppi_ms) {
         }
     }
 
-    s_ppi_buf[s_ppi_idx] = ppi_ms;
-    s_ppi_idx = (s_ppi_idx + 1) % HRV_BUF_SIZE;
-    if (s_ppi_count < HRV_BUF_SIZE) s_ppi_count++;
-    s_last_ppi_time = time(NULL);
-    APP_LOG(APP_LOG_LEVEL_DEBUG,
-        "NapBuster HRV: PPI %u ms accepted (%d in ring)",
-        (unsigned)ppi_ms, (int)s_ppi_count);
+    time_t now = time(NULL);
+
+    // A gap since the burst started means the previous volley is complete
+    if (s_cur_burst_n > 0 && (now - s_cur_burst_start) > BURST_GAP_SECS) {
+        prv_finalize_burst();
+    }
+
+    if (s_cur_burst_n == 0) {
+        s_cur_burst_start = now;
+    } else {
+        int32_t d = (int32_t)ppi_ms - (int32_t)s_cur_burst_prev_ppi;
+        if (d < 0) d = -d;
+        s_cur_burst_rsa_sum += (uint32_t)d;
+        s_cur_burst_rsa_n++;
+    }
+    s_cur_burst_sum += ppi_ms;
+    s_cur_burst_n++;
+    s_cur_burst_prev_ppi = ppi_ms;
 }
 
 /**
- * PPI spread: mean absolute successive difference (ms) over the accepted-PPI
- * ring in chronological order — an RMSSD-like dispersion proxy at our 2-min
- * sample cadence. Returns -1 when there aren't enough fresh samples.
+ * Drift spread: mean absolute successive difference (ms) over the burst-mean
+ * ring in chronological order — how much average HR wanders between sensor
+ * bursts. High while awake (posture, cognition, micro-arousals keep HR
+ * moving); collapses during sleep. Returns -1 when there aren't enough fresh
+ * bursts. Finalizes a lingering in-progress burst first so analysis cycles
+ * always see the newest complete volley.
  */
 static int prv_compute_ppi_spread(void) {
-    if (s_ppi_count < HRV_MIN_SAMPLES) return -1;
-    if (s_last_ppi_time == 0 ||
-        (time(NULL) - s_last_ppi_time) > HRV_STALE_SECS) return -1;
+    if (s_cur_burst_n > 0 &&
+        (time(NULL) - s_cur_burst_start) > BURST_GAP_SECS) {
+        prv_finalize_burst();
+    }
 
-    uint8_t start = (s_ppi_count == HRV_BUF_SIZE) ? s_ppi_idx : 0;
+    if (s_burst_count < HRV_MIN_SAMPLES) return -1;
+    if (s_last_burst_time == 0 ||
+        (time(NULL) - s_last_burst_time) > HRV_STALE_SECS) return -1;
+
+    uint8_t start = (s_burst_count == HRV_BUF_SIZE) ? s_burst_idx : 0;
     int32_t sum = 0;
-    for (uint8_t i = 1; i < s_ppi_count; i++) {
-        int32_t a = s_ppi_buf[(uint8_t)((start + i - 1) % HRV_BUF_SIZE)];
-        int32_t b = s_ppi_buf[(uint8_t)((start + i) % HRV_BUF_SIZE)];
+    for (uint8_t i = 1; i < s_burst_count; i++) {
+        int32_t a = s_burst_buf[(uint8_t)((start + i - 1) % HRV_BUF_SIZE)];
+        int32_t b = s_burst_buf[(uint8_t)((start + i) % HRV_BUF_SIZE)];
         int32_t d = b - a;
         if (d < 0) d = -d;
         sum += d;
     }
-    return (int)(sum / (s_ppi_count - 1));
+    return (int)(sum / (s_burst_count - 1));
 }
 
 // ─── Launch Logic ─────────────────────────────────────────────────────────────
@@ -701,10 +782,12 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
         if (s_hr_awake_baseline > BASELINE_MAX_BPM) s_hr_awake_baseline = BASELINE_MAX_BPM;
     }
 
-    // ── 5b. PPI spread + anchored awake-spread baseline ───────────────────────
-    // Inverse anchoring vs the HR baseline: sleep onset RAISES spread, so
-    // up-moves only happen while HR proves wakefulness (and the wrist is quiet
-    // enough for trustworthy PPIs); down-moves are always safe.
+    // ── 5b. Drift spread + anchored awake-drift baseline ──────────────────────
+    // Sleep onset LOWERS drift, so DOWN is the dangerous direction: down-moves
+    // only happen while HR proves wakefulness (v2.3.0 had this mirrored, and
+    // the baseline chased the user into their doze). Up-moves are safe from
+    // sleep-chasing but need a quiet wrist so motion-garbage PPIs can't
+    // inflate the anchor.
     int spread = prv_compute_ppi_spread();
     if (spread >= 0 && s_hr_awake_baseline > 0) {
         bool clearly_awake =
@@ -716,9 +799,11 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
             if (clearly_awake) {
                 s_hrv_awake_baseline = (int16_t)spread;
                 APP_LOG(APP_LOG_LEVEL_INFO,
-                    "NapBuster HRV: awake spread baseline seeded at %d ms", spread);
+                    "NapBuster HRV: awake drift baseline seeded at %d ms", spread);
             }
-        } else if (spread <= s_hrv_awake_baseline || clearly_awake) {
+        } else if ((spread >= s_hrv_awake_baseline &&
+                    current_vmc < HRV_QUIET_VMC) ||
+                   clearly_awake) {
             s_hrv_awake_baseline =
                 (int16_t)((s_hrv_awake_baseline * 7 + spread) / 8);
         }
@@ -737,19 +822,21 @@ static void prv_run_tier1_analysis(int16_t hr_val) {
         bool hr_drop_full =
             ((int32_t)smoothed_hr * 100) < ((int32_t)s_hr_awake_baseline * drop_pct);
 
-        // HRV-primary path: an elevated PPI spread plus a mild HR dip fires
-        // earlier than the full HR drop. The full-drop path stays live as
-        // insurance for naps where the spread signal is missing or muted.
+        // HRV-primary path: suppressed inter-burst drift (average HR gone
+        // metronomic — the earliest observable sign of the doze-off slide)
+        // plus a mild HR dip fires earlier than the full HR drop. The
+        // full-drop path stays live as insurance for naps where the drift
+        // signal is missing or the baseline is still warming up.
         bool hrv_ready = (spread >= 0 && s_hrv_awake_baseline > 0);
         bool hrv_positive = false;
         if (hrv_ready) {
-            bool hrv_elevated =
-                (int32_t)spread * 100 >=
-                (int32_t)s_hrv_awake_baseline * prv_get_hrv_rise_pct();
+            bool hrv_suppressed =
+                (int32_t)spread * 100 <=
+                (int32_t)s_hrv_awake_baseline * prv_get_hrv_suppress_pct();
             bool hr_soft_drop =
                 ((int32_t)smoothed_hr * 100) <
                 ((int32_t)s_hr_awake_baseline * prv_get_hr_soft_pct());
-            hrv_positive = hrv_elevated && hr_soft_drop;
+            hrv_positive = hrv_suppressed && hr_soft_drop;
         }
 
         bool positive = still && (hrv_positive || hr_drop_full);
@@ -1038,7 +1125,7 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
 // ─── Worker Lifecycle ─────────────────────────────────────────────────────────
 
 static void worker_init(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v7: starting");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v8: starting");
 
     app_worker_message_subscribe(prv_app_message_handler);
 
@@ -1046,12 +1133,12 @@ static void worker_init(void) {
     // health service isn't ready yet). False on basalt/chalk → Tier 2 only.
     s_hr_capable = prv_probe_hr_capable();
     APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker v7: HR capable=%d", (int)s_hr_capable);
+        "NapBuster worker v8: HR capable=%d", (int)s_hr_capable);
 
     if (s_hr_capable) {
         prv_load_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v7: loaded HR state count=%d streak=%d baseline=%d",
+            "NapBuster worker v8: loaded HR state count=%d streak=%d baseline=%d",
             (int)s_hr_buf_count, (int)s_trigger_streak, (int)s_hr_awake_baseline);
     }
 
@@ -1065,7 +1152,7 @@ static void worker_init(void) {
 }
 
 static void worker_deinit(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v7: stopping");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v8: stopping");
 
     prv_set_hr_boost(false);   // never leave a boosted sample period behind
     prv_set_hrv_boost(false);  // ditto for the HRV period
@@ -1077,7 +1164,7 @@ static void worker_deinit(void) {
     if (s_hr_capable) {
         prv_save_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v7: saved HR state count=%d streak=%d",
+            "NapBuster worker v8: saved HR state count=%d streak=%d",
             (int)s_hr_buf_count, (int)s_trigger_streak);
     }
 }
