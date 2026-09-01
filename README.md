@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v2.5.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v3.0.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When NapBuster sees sustained signs that you may be dozing during your configured no-nap hours, it gives you a gentle nudge. If stronger evidence continues and you do not appear to respond, it escalates to a repeating alarm.
 
@@ -8,7 +8,7 @@ When NapBuster sees sustained signs that you may be dozing during your configure
 
 ## How it works
 
-NapBuster combines heart rate with recent movement instead of treating any one low reading as sleep:
+NapBuster keeps VMC-based wrist stillness as its primary doze context, then requires a matching heart-rate drop before it considers that stillness a possible nap. Neither signal can trigger an alert by itself:
 
 ```text
 Timestamped HR event + newest five completed motion minutes
@@ -68,7 +68,7 @@ Contiguous, artifact-gated PPI readings can produce an **RMSSD diagnostic** on P
 
 ### Baseline migration
 
-v2.5 uses a new detector-state schema. On first run it clears the old HR baseline together with incompatible rolling buffers, streaks, VMC EMA, and HRV state, then recalibrates from stable quiet-awake readings. This deliberately avoids carrying forward a baseline that the previous algorithm may have inflated or allowed to follow a doze.
+v3.0 uses a new detector-state schema. On first run it clears the old HR baseline together with incompatible rolling buffers, streaks, VMC EMA, and HRV state, then recalibrates from stable quiet-awake readings. This deliberately avoids carrying forward a baseline that the previous algorithm may have inflated or allowed to follow a doze.
 
 ---
 
@@ -245,7 +245,7 @@ Keeping the detector free of Pebble SDK dependencies makes timestamp, gap, basel
 | Key | Name | Notes |
 |---:|---|---|
 | 0–5, 7–8 | Settings/alarm/wakeup | Master switch, schedule, snooze, alarm, vibration, active days |
-| 10–12, 14 | Legacy detector state | Cleared during v2.5 schema migration |
+| 10–12, 14 | Legacy detector state | Cleared during v3.0 schema migration |
 | 13 | `TRIGGER_STREAK` | Whole minutes of accumulated positive evidence |
 | 15 | `DEBUG_HR` | Last smoothed HR |
 | 16 | `DEBUG_AVG` | Awake HR baseline for display |
@@ -255,7 +255,7 @@ Keeping the detector free of Pebble SDK dependencies makes timestamp, gap, basel
 | 20–21 | Nudge/dismiss coordination | Foreground request and alarm cooldown |
 | 22 | Legacy streak start | Cleared during schema migration |
 | 23 | `DEBUG_LAST_TS` | Last completed analysis timestamp |
-| 24 | Legacy HRV baseline | Unused by v2.5 |
+| 24 | Legacy HRV baseline | Unused by v3.0 |
 | 25 | `DEBUG_HRV` | Candidate PPI RMSSD, or −1 |
 | 26 | `ALARM_START` | Foreground alarm timestamp / stale-flag watchdog |
 | 27 | `DETECTOR_SCHEMA` | Detector persistence schema version |
@@ -279,9 +279,9 @@ NapBuster is a convenience tool, **not a medical or safety device**. Do not rely
 
 | Version | What changed |
 |---|---|
-| **2.5.0** | Replaced the accumulated v2.x trigger logic with a portable ARMED → CANDIDATE → NUDGED detector; fresh event-driven raw HR with 20-second burst rejection and median-of-three smoothing; stable quiet baseline calibration; completed VMC/step summaries; bounded/decaying evidence; 8/12/16% full and 4/6/8% soft HR-drop thresholds, with soft-only episodes limited to a nudge; candidate-only 20-second sensor probing; PPI RMSSD as diagnostic telemetry only; a new persistence schema and host scenario tests. Fixed overnight active-day ownership, snooze expiry outside the guard window, and a foreground launch race that could turn a nudge into a full alarm. |
+| **3.0.0** | Replaced the accumulated v2.x trigger logic with a portable ARMED → CANDIDATE → NUDGED detector; fresh event-driven raw HR with 20-second burst rejection and median-of-three smoothing; stable quiet baseline calibration; completed VMC/step summaries; bounded/decaying evidence; 8/12/16% full and 4/6/8% soft HR-drop thresholds, with soft-only episodes limited to a nudge; candidate-only 20-second sensor probing; PPI RMSSD as diagnostic telemetry only; a new persistence schema and host scenario tests. Fixed overnight active-day ownership, snooze expiry outside the guard window, and a foreground launch race that could turn a nudge into a full alarm. |
 | **2.4.1** | Fixed stale foreground alarm state that could prevent later alarms. |
-| **2.4.0–2.3.0** | Experimented with an inter-burst PPI drift signal. v2.5 removes it from detection because it was not a valid substitute for contiguous-beat HRV and was not sufficiently validated. |
+| **2.4.0–2.3.0** | Experimented with an inter-burst PPI drift signal. v3.0 removes it from detection because it was not a valid substitute for contiguous-beat HRV and was not sufficiently validated. |
 | **2.2.0–2.0.0** | Added guard-window sensor ownership, time-based nudge/alarm stages, and alarm cooldown handling. |
 | **1.8.0–1.4.0** | Introduced anchored HR, VMC motion context, sensitivity controls, and debug telemetry. |
 | **1.3.0–1.0.0** | Added alarm controls, background detection, and Pebble Health fallback. |

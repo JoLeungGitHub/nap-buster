@@ -42,7 +42,7 @@
 #define PERSIST_KEY_DEBUG_HRV           25
 #define PERSIST_KEY_ALARM_START         26
 
-// Detector-v2 persistence/telemetry.
+// Detector-v3 persistence/telemetry.
 #define PERSIST_KEY_DETECTOR_SCHEMA     27
 #define PERSIST_KEY_LAST_NUDGE          28
 #define PERSIST_KEY_DEBUG_PHASE         29

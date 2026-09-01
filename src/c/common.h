@@ -29,7 +29,7 @@
 #define PERSIST_KEY_LAST_DISMISS     21  // time_t: last alarm dismissal (worker cooldown gate)
 #define PERSIST_KEY_STREAK_START     22  // legacy detector transient (cleared by schema migration)
 #define PERSIST_KEY_DEBUG_LAST_TS    23  // time_t: when the worker last completed an analysis
-#define PERSIST_KEY_HRV_BASELINE     24  // legacy HRV baseline (unused by detector v2.5)
+#define PERSIST_KEY_HRV_BASELINE     24  // legacy HRV baseline (unused by detector v3.0)
 #define PERSIST_KEY_DEBUG_HRV        25  // int: candidate PPI RMSSD diagnostic (ms), -1=unavailable
 #define PERSIST_KEY_ALARM_START      26  // time_t: when the foreground alarm began
 #define PERSIST_KEY_DETECTOR_SCHEMA  27  // int: persisted detector-state schema version
