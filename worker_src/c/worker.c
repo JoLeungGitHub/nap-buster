@@ -867,7 +867,7 @@ static void prv_minute_tick(struct tm *tick_time, TimeUnits units_changed) {
     if (s_detector.phase != NAP_DETECTOR_ARMED &&
         (s_last_accepted_hr_time <= 0 || now < s_last_accepted_hr_time ||
          (now - s_last_accepted_hr_time) >
-             NAP_DETECTOR_MAX_GAP_SECONDS)) {
+             (time_t)NAP_DETECTOR_MAX_GAP_SECONDS)) {
         // With no callbacks the portable core cannot observe the gap itself.
         // Bound candidate lifetime here so fast HR/HRV requests cannot stick.
         prv_reset_episode();
