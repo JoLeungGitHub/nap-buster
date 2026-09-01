@@ -31,6 +31,7 @@
 #define PERSIST_KEY_DEBUG_LAST_TS    23  // time_t: when the worker last completed an analysis
 #define PERSIST_KEY_HRV_BASELINE     24  // int16: anchored awake drift baseline (ms)
 #define PERSIST_KEY_DEBUG_HRV        25  // int: last drift spread (ms), -1 = unavailable
+#define PERSIST_KEY_ALARM_START      26  // time_t: when the foreground alarm began
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1

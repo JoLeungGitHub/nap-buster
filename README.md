@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v2.4.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v2.4.1** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When it detects you're falling asleep during your configured no-nap hours, it vibrates until you wake up and dismiss it.
 
@@ -104,6 +104,7 @@ To check your installed version: open NapBuster → long-press SELECT → versio
 
 | Version | What changed |
 |---|---|
+| **2.4.1** | **Critical fix — a stuck flag could permanently disable the alarm.** `ALARMING` was only ever cleared by the alarm screen's own buttons, but BACK isn't bound during an alarm, so leaving that way (or an app timeout/kill) left it set forever and the worker refused every later launch. Seen in the wild as a trigger streak of x26 — ~52 minutes of confirmed dozing — with no alarm. Now: exiting mid-alarm counts as a dismissal (`app_deinit` clears the flag and notifies the worker); the app self-heals a stale flag whenever it opens without alarming; and two worker watchdogs expire stuck state regardless — an `ALARMING` flag older than 30 min (or lacking the new timestamp, i.e. written by an older build) and a launch left unacknowledged for 5 min. Installing this release clears an already-stuck flag automatically |
 | **2.4.0** | HRV direction fix, grounded in the sensor's actual behavior (the Goodix driver delivers up to 4 adjacent-beat RRs per burst, one event each — undocumented; verified in PebbleOS source): PPIs are now grouped into bursts and reduced to burst-mean PPIs, so the ring measures pure **inter-burst drift**, which on-wrist data shows is ~140–165 ms awake and collapses to ~30 ms while dozing — the *opposite* of v2.3.0's assumed rMSSD rise. Trigger flipped to drift **suppression** (≤60/50/40% of awake baseline per sensitivity) + the half-strength HR dip; baseline anchoring mirrored (down-moves now need proof of wakefulness — v2.3.0's free-down anchor chased the user into their doze, 163→35 ms); up-moves require a quiet wrist so motion garbage can't inflate the anchor. Within-burst adjacent-beat variability (true rMSSD) is logged per burst as a candidate future signal. A contaminated v2.3.0 baseline self-heals upward within ~25 min of quiet wakefulness |
 | **2.3.0** | HRV-primary detection (SDK 4.33 APIs, Pebble Time 2): worker requests an HRV sample period alongside the HR period (shared sensor subscription at the same 120 s — zero extra sensor wakeups); each `HealthEventHRVUpdate` PPI is artifact-gated (300–2000 ms + ±40% of HR-implied interval, since firmware forwards readings unfiltered) into an 8-sample ring; "PPI spread" (mean abs successive difference) vs an inverted-anchored awake-spread baseline adds an early trigger path — spread ≥ 25/40/60% above baseline (per sensitivity) + a *half*-strength HR dip; the full HR-drop path stays as insurance and is the sole path on Pebble 2 / firmware <4.33. Debug line shows `h:spread/base` in HRV mode. Requires PebbleOS ≥ 4.33 |
 | **2.2.0** | Battery: HealthService is no longer subscribed 24/7 on HR-capable platforms — it now subscribes only during the guard window plus a 2-hour lead-in beforehand (`WARM_LEAD_HOURS`), so the awake baseline is still warm by the time guarding starts. The 5-minute fallback timer only runs while that subscription is active, instead of waking the CPU every 5 minutes all day regardless of the window. |
@@ -345,6 +346,7 @@ nap-buster/
 | `23` | `DEBUG_LAST_TS` | time_t | When the worker last completed an analysis |
 | `24` | `HRV_BASELINE` | int16 | Anchored awake drift baseline (ms) |
 | `25` | `DEBUG_HRV` | int | Last drift spread (ms), −1 = unavailable |
+| `26` | `ALARM_START` | time_t | When the foreground alarm began — stale-flag watchdog |
 
 ---
 

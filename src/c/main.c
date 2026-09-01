@@ -112,6 +112,9 @@ static void start_alarm(void) {
     if (s_is_alarming) return;
     s_is_alarming = true;
     persist_write_int(PERSIST_KEY_ALARMING, 1);
+    // Timestamp lets the worker recognise (and clear) a flag left set by an
+    // app that exited without acknowledging its alarm.
+    persist_write_int(PERSIST_KEY_ALARM_START, (int)time(NULL));
 
     window_set_background_color(s_win, GColorRed);
 
@@ -145,6 +148,7 @@ static void stop_alarm(void) {
     }
     vibes_cancel();
     persist_write_int(PERSIST_KEY_ALARMING, 0);
+    persist_delete(PERSIST_KEY_ALARM_START);
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
     cancel_existing_wakeup();
 
@@ -190,6 +194,7 @@ static void schedule_snooze(int minutes) {
     time_t snooze_until = time(NULL) + (minutes * 60);
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, (int)snooze_until);
     persist_write_int(PERSIST_KEY_ALARMING, 0);
+    persist_delete(PERSIST_KEY_ALARM_START);
 
     WakeupId wid = wakeup_schedule(snooze_until, WAKEUP_REASON_SNOOZE, true);
     if (wid >= 0) persist_write_int(PERSIST_KEY_WAKEUP_ID_SNOOZE, (int)wid);
@@ -213,6 +218,21 @@ static void prv_state_bar_update(Layer *layer, GContext *ctx) {
 /** Determine current state and refresh all home screen layers. */
 static void update_home_screen(void) {
     if (s_is_alarming) return;
+
+    // ── Self-heal a stale ALARMING flag ──
+    // If this app is running and is NOT alarming, no alarm can be active —
+    // the alarm only exists inside this process. A flag left set (app exited
+    // via BACK during an alarm, timed out, or was killed) would otherwise
+    // make the worker refuse to launch an alarm ever again.
+    if (persist_exists(PERSIST_KEY_ALARMING) &&
+        persist_read_int(PERSIST_KEY_ALARMING)) {
+        persist_write_int(PERSIST_KEY_ALARMING, 0);
+        persist_delete(PERSIST_KEY_ALARM_START);
+        AppWorkerMessage heal = { .data0 = APP_MSG_DISMISS };
+        app_worker_send_message(APP_MSG_DISMISS, &heal);
+        APP_LOG(APP_LOG_LEVEL_WARNING,
+            "NapBuster: cleared stale ALARMING flag — guarding restored");
+    }
 
     // ── Clear alarm side-button labels and restore normal colors ──
     text_layer_set_text_color(s_up_label,  GColorLightGray);
@@ -645,6 +665,20 @@ static void app_deinit(void) {
         s_vibe_timer = NULL;
     }
     vibes_cancel();
+
+    // Leaving while the alarm is up — BACK (which is not bound during an
+    // alarm, so it exits), an inactivity timeout, or a kill — counts as a
+    // dismissal. Without this the ALARMING flag stays set and the worker goes
+    // permanently deaf; the vibration has already stopped either way.
+    if (s_is_alarming) {
+        s_is_alarming = false;
+        persist_write_int(PERSIST_KEY_ALARMING, 0);
+        persist_delete(PERSIST_KEY_ALARM_START);
+        persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
+        AppWorkerMessage msg = { .data0 = APP_MSG_DISMISS };
+        app_worker_send_message(APP_MSG_DISMISS, &msg);
+    }
+
     app_worker_message_unsubscribe();
     window_destroy(s_win);
 }
