@@ -1,5 +1,5 @@
 /**
- * worker.c — NapBuster Background Worker v8
+ * worker.c — NapBuster Background Worker v9
  *
  * Two-tier sleep detection:
  *
@@ -114,6 +114,7 @@
 #define PERSIST_KEY_DEBUG_LAST_TS     23  // time_t: when the last analysis cycle completed
 #define PERSIST_KEY_HRV_BASELINE      24  // int16: anchored awake drift baseline (ms)
 #define PERSIST_KEY_DEBUG_HRV         25  // int: last drift spread (ms), -1 = unavailable
+#define PERSIST_KEY_ALARM_START       26  // time_t: when the foreground alarm began
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -168,6 +169,13 @@
 #define NUDGE_COOLDOWN_SECS   600     // at most one nudge per 10 min
 #define DISMISS_COOLDOWN_SECS 600     // after a dismiss, no nudge/alarm for 10 min
 
+// Stuck-state watchdogs. Both flags below are set by us or the foreground and
+// cleared by an acknowledgement that can be lost (app killed, exited via BACK
+// before v2.4.1, message dropped). Left stuck, either one silently disables
+// detection forever — so both expire.
+#define ALARM_STALE_SECS      1800    // "alarming" longer than 30 min = stale flag
+#define LAUNCH_PENDING_SECS   300     // launch unacknowledged after 5 min = failed
+
 #define SAMPLE_INTERVAL_MS    300000  // 5 minutes (fallback timer)
 #define SAMPLE_INTERVAL_SECS  300
 #define WINDOW_CHECK_MS       60000   // 1 minute window boundary check
@@ -176,6 +184,8 @@
 
 // True once worker_launch_app() called and haven't gotten a dismiss/awake yet
 static bool s_launch_pending    = false;
+// When that launch was requested, so an unacknowledged one can expire
+static time_t s_launch_pending_time = 0;
 
 // True when HealthService is currently subscribed
 static bool s_health_subscribed = false;
@@ -383,9 +393,32 @@ static bool prv_is_snoozed(void) {
     return time(NULL) < snooze_until;
 }
 
+/**
+ * True if the foreground currently has an alarm up.
+ *
+ * A flag with no timestamp (written by a pre-2.4.1 build) or one older than
+ * ALARM_STALE_SECS is treated as stale and cleared: no genuine alarm session
+ * lasts that long — the user dismisses or snoozes — and before 2.4.1 exiting
+ * the alarm screen with BACK left this set forever, which made the worker
+ * refuse every subsequent launch while the trigger streak climbed unchecked.
+ */
 static bool prv_is_already_alarming(void) {
     if (!persist_exists(PERSIST_KEY_ALARMING)) return false;
-    return (bool)persist_read_int(PERSIST_KEY_ALARMING);
+    if (!persist_read_int(PERSIST_KEY_ALARMING)) return false;
+
+    time_t started = persist_exists(PERSIST_KEY_ALARM_START)
+                     ? (time_t)persist_read_int(PERSIST_KEY_ALARM_START) : 0;
+    time_t now = time(NULL);
+
+    if (started <= 0 || now < started || (now - started) > ALARM_STALE_SECS) {
+        APP_LOG(APP_LOG_LEVEL_WARNING,
+            "NapBuster worker: stale ALARMING flag cleared (age=%lds)",
+            started > 0 ? (long)(now - started) : -1L);
+        persist_write_int(PERSIST_KEY_ALARMING, 0);
+        persist_delete(PERSIST_KEY_ALARM_START);
+        return false;
+    }
+    return true;
 }
 
 /** True within DISMISS_COOLDOWN_SECS of the user dismissing an alarm. */
@@ -659,6 +692,15 @@ static int prv_compute_ppi_spread(void) {
 
 /** Launch the foreground alarm if every guard passes. Returns true if launched. */
 static bool prv_try_launch_foreground(void) {
+    // An unacknowledged launch (app never came up, or came up and died without
+    // sending a dismiss) must not block detection indefinitely.
+    if (s_launch_pending && s_launch_pending_time > 0 &&
+        (time(NULL) - s_launch_pending_time) > LAUNCH_PENDING_SECS) {
+        APP_LOG(APP_LOG_LEVEL_WARNING,
+            "NapBuster worker: launch unacknowledged for %ds — retrying",
+            (int)(time(NULL) - s_launch_pending_time));
+        s_launch_pending = false;
+    }
     if (s_launch_pending)              return false;
     if (prv_is_already_alarming())     return false;
     if (prv_is_snoozed())              return false;
@@ -673,6 +715,7 @@ static bool prv_try_launch_foreground(void) {
     persist_delete(PERSIST_KEY_NUDGE_PENDING);
 
     s_launch_pending = true;
+    s_launch_pending_time = time(NULL);
     worker_launch_app();
 
     // If app is already in foreground, also send a direct message
@@ -1125,7 +1168,7 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
 // ─── Worker Lifecycle ─────────────────────────────────────────────────────────
 
 static void worker_init(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v8: starting");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v9: starting");
 
     app_worker_message_subscribe(prv_app_message_handler);
 
@@ -1133,12 +1176,12 @@ static void worker_init(void) {
     // health service isn't ready yet). False on basalt/chalk → Tier 2 only.
     s_hr_capable = prv_probe_hr_capable();
     APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker v8: HR capable=%d", (int)s_hr_capable);
+        "NapBuster worker v9: HR capable=%d", (int)s_hr_capable);
 
     if (s_hr_capable) {
         prv_load_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v8: loaded HR state count=%d streak=%d baseline=%d",
+            "NapBuster worker v9: loaded HR state count=%d streak=%d baseline=%d",
             (int)s_hr_buf_count, (int)s_trigger_streak, (int)s_hr_awake_baseline);
     }
 
@@ -1152,7 +1195,7 @@ static void worker_init(void) {
 }
 
 static void worker_deinit(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v8: stopping");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v9: stopping");
 
     prv_set_hr_boost(false);   // never leave a boosted sample period behind
     prv_set_hrv_boost(false);  // ditto for the HRV period
@@ -1164,7 +1207,7 @@ static void worker_deinit(void) {
     if (s_hr_capable) {
         prv_save_hr_state();
         APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v8: saved HR state count=%d streak=%d",
+            "NapBuster worker v9: saved HR state count=%d streak=%d",
             (int)s_hr_buf_count, (int)s_trigger_streak);
     }
 }
