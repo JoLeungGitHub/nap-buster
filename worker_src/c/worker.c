@@ -1,1163 +1,937 @@
 /**
- * worker.c — NapBuster Background Worker v9
+ * worker.c - NapBuster background-worker adapter
  *
- * Two-tier sleep detection:
- *
- *   TIER 1 (HR-capable platforms: emery/diorite)
- *   ─────────────────────────────────────────────
- *   Inside the guard window the worker OWNS the HR cadence: it requests a
- *   120-second heart-rate sample period (health_service_set_heart_rate_sample_period),
- *   so HealthEventHeartRateUpdate arrives ~once every 2 minutes instead of the OS
- *   default of once every ~10 minutes (and even less often during long
- *   stillness — exactly when a nap is happening). Outside the window the
- *   boost is cancelled and Tier 1 rides free on the OS's own background
- *   samples to keep the awake baseline warm.
- *
- *   HRV (SDK 4.33+, Pebble Time 2 hardware): alongside the HR period the
- *   worker requests an HRV sample period at the SAME 120 s interval — the two
- *   share one sensor subscription driven at the shorter period, so this adds
- *   no sensor wakeups over v2.2. The Goodix driver reports up to 4
- *   adjacent-beat RR intervals per sensor burst, one HealthEventHRVUpdate
- *   each, with NO firmware quality filtering — so we artifact-gate each PPI
- *   (physiological range + agreement with current HR), group readings into
- *   bursts (≤ BURST_GAP_SECS apart), and keep a ring of burst-mean PPIs.
- *   The mean absolute successive difference over that ring ("drift spread")
- *   measures how much average HR wanders between bursts — HIGH while awake
- *   (on-wrist: ~140-165 ms), COLLAPSING as the user dozes (~30 ms). v2.3.0
- *   assumed textbook rMSSD behavior (variability rises at sleep onset) and
- *   had this inverted; the drift term dominates at a 2-minute cadence and
- *   moves the other way. Detection is HRV-primary where available:
- *     positive = still AND (drift suppressed AND HR mildly low)  ← early path
- *                       OR (HR fully dropped)                    ← v2.2 path
- *   The awake-drift baseline anchors with DOWN as the dangerous direction:
- *   it only falls while HR proves wakefulness, and rises only with a quiet
- *   wrist (motion garbage must not inflate it). Within-burst adjacent-beat
- *   variability (true rMSSD material, expected to RISE in sleep) is computed
- *   and logged per burst for future validation, but does not yet gate.
- *   On watches without HRV (Pebble 2, or firmware <4.33) the request fails
- *   and detection is exactly the v2.2 HR-only behavior.
- *
- *   Each analysis cycle needs BOTH a valid HR reading and a valid VMC minute
- *   record. Missing data FREEZES the detection state (skip cycle) — it never
- *   resets the streak. Only positive evidence of wakefulness (valid HR that
- *   isn't dropped, or clear movement) resets it. This matters because
- *   health_service_peek_current_value(HeartRateBPM) returns 0 once the
- *   filtered sample is >15 min old, which used to zero the streak mid-nap.
- *
- *   Two-stage wake, time-based (cadence-independent):
- *     • nudge:      ≥2 positive cycles sustained ≥4 min  → double-pulse launch
- *     • full alarm: ≥3 positive cycles sustained ≥10 min → repeating alarm
- *   With the time-based thresholds this holds regardless of cadence: nudge
- *   still fires once ~4 min of sustained evidence accumulates, alarm once
- *   ~10 min does — 120 s samples just mean up to one extra cadence tick
- *   (~2 min) of slop versus the 60 s cadence before crossing that mark. If
- *   the OS
- *   rejects the boost (default 10-min cadence) it degrades to ~10 min nudge,
- *   ~20 min alarm — the same latency v1.7 promised but could not deliver.
- *
- *   TIER 2 (ALL platforms)
- *   ─────────────────────────────────────────────
- *   HealthService sleep-activity confirmation as a fallback (slow: the OS
- *   classifies sleep with 45-90+ min latency, and short naps may never be
- *   classified at all). On basalt/chalk this is the only tier.
- *
- * Lifecycle:
- *   HR-capable  → HealthService subscribed during the guard window AND for a
- *                 WARM_LEAD_HOURS (2h) lead-in beforehand, so the awake
- *                 baseline is warm the moment guarding starts. Fully
- *                 unsubscribed the rest of the day — no more 24/7 always-on
- *                 subscription. 5-min fallback timer only runs while
- *                 subscribed. HR boost only inside the window itself.
- *   non-HR      → HealthService subscribed only inside the window (Tier 2).
- *   A 60-second timer drives window-boundary transitions either way.
- *
- * SDK notes:
- *   - worker_launch_app() returns void
- *   - WakeupId / wakeup_schedule() NOT available in worker context
- *   - HealthService IS fully available in workers (incl. set_heart_rate_sample_period)
- *   - peek_current_value(HeartRateBPM) self-limits to samples <15 min old
- *   - health_service_get_minute_history() records may be invalid/lagging —
- *     search back several minutes for the newest valid VMC
+ * Detection itself lives in nap_detector.c and has no Pebble dependencies.
+ * This file owns the platform edges: fresh HealthService events, completed
+ * minute motion summaries, sensor cadence, schedule boundaries, persistence,
+ * foreground launches, and diagnostic telemetry.
  */
 
 #include <pebble_worker.h>
 
-// ─── Shared Persist Keys ──────────────────────────────────────────────────────
+#include "nap_detector.h"
 
-#define PERSIST_KEY_ENABLED            0
-#define PERSIST_KEY_START_HOUR         1
-#define PERSIST_KEY_END_HOUR           2
-#define PERSIST_KEY_SNOOZE_UNTIL       3
-#define PERSIST_KEY_ALARMING           4
-#define PERSIST_KEY_ACTIVE_DAYS        8  // uint8 bitmask bit0=Sun..bit6=Sat
+#include <string.h>
 
-// Tier-1 state (persisted across worker restarts)
-#define PERSIST_KEY_HR_BUFFER         10  // int16_t[HR_BUF_SIZE] blob
-#define PERSIST_KEY_HR_BUF_IDX        11  // uint8_t write index
-#define PERSIST_KEY_HR_BUF_COUNT      12  // uint8_t valid count (max HR_BUF_SIZE)
-#define PERSIST_KEY_TRIGGER_STREAK    13  // uint8_t consecutive positive cycles
-#define PERSIST_KEY_VMC_EMA           14  // uint32_t EMA of VMC
+// Shared settings/state keys (kept in sync with src/c/common.h).
+#define PERSIST_KEY_ENABLED             0
+#define PERSIST_KEY_START_HOUR          1
+#define PERSIST_KEY_END_HOUR            2
+#define PERSIST_KEY_SNOOZE_UNTIL        3
+#define PERSIST_KEY_ALARMING            4
+#define PERSIST_KEY_ACTIVE_DAYS         8
 
-// Tier-1 debug telemetry (written each analysis cycle, read by foreground app)
-#define PERSIST_KEY_DEBUG_HR          15  // int16: last smoothed HR BPM
-#define PERSIST_KEY_DEBUG_AVG         16  // int16: anchored awake baseline
-#define PERSIST_KEY_DEBUG_ACCEL       17  // int32: last VMC reading
+// Legacy detector keys. They are removed by the one-time schema migration.
+#define PERSIST_KEY_HR_BUFFER           10
+#define PERSIST_KEY_HR_BUF_IDX          11
+#define PERSIST_KEY_HR_BUF_COUNT        12
+#define PERSIST_KEY_TRIGGER_STREAK      13
+#define PERSIST_KEY_VMC_EMA             14
 
-// Detection sensitivity (shared with foreground app)
-#define PERSIST_KEY_SENSITIVITY       18  // int: 0=Sensitive 1=Balanced 2=Conservative
-#define DEFAULT_SENSITIVITY           1   // Balanced
+// Foreground diagnostics/settings.
+#define PERSIST_KEY_DEBUG_HR            15
+#define PERSIST_KEY_DEBUG_AVG           16
+#define PERSIST_KEY_DEBUG_ACCEL         17
+#define PERSIST_KEY_SENSITIVITY         18
+#define PERSIST_KEY_HR_BASELINE         19
+#define PERSIST_KEY_NUDGE_PENDING       20
+#define PERSIST_KEY_LAST_DISMISS        21
+#define PERSIST_KEY_STREAK_START        22
+#define PERSIST_KEY_DEBUG_LAST_TS       23
+#define PERSIST_KEY_HRV_BASELINE        24
+#define PERSIST_KEY_DEBUG_HRV           25
+#define PERSIST_KEY_ALARM_START         26
 
-#define PERSIST_KEY_HR_BASELINE       19  // int16: anchored awake HR baseline
-#define PERSIST_KEY_NUDGE_PENDING     20  // bool: worker set nudge, foreground should pulse+clear
-#define PERSIST_KEY_LAST_DISMISS      21  // time_t: last alarm dismissal (written by foreground)
-#define PERSIST_KEY_STREAK_START      22  // time_t: first positive cycle of current streak
-#define PERSIST_KEY_DEBUG_LAST_TS     23  // time_t: when the last analysis cycle completed
-#define PERSIST_KEY_HRV_BASELINE      24  // int16: anchored awake drift baseline (ms)
-#define PERSIST_KEY_DEBUG_HRV         25  // int: last drift spread (ms), -1 = unavailable
-#define PERSIST_KEY_ALARM_START       26  // time_t: when the foreground alarm began
+// Detector-v2 persistence/telemetry.
+#define PERSIST_KEY_DETECTOR_SCHEMA     27
+#define PERSIST_KEY_LAST_NUDGE          28
+#define PERSIST_KEY_DEBUG_PHASE         29
+#define PERSIST_KEY_WORKER_STATUS       30
+#define DETECTOR_SCHEMA_VERSION          1
 
-// ─── Defaults ─────────────────────────────────────────────────────────────────
+#define DEFAULT_ENABLED                  1
+#define DEFAULT_START_HOUR              11
+#define DEFAULT_END_HOUR                23
+#define DEFAULT_ACTIVE_DAYS             0x7F
+#define DEFAULT_SENSITIVITY              1
 
-#define DEFAULT_ENABLED                1
-#define DEFAULT_START_HOUR             11
-#define DEFAULT_END_HOUR               23
-#define DEFAULT_ACTIVE_DAYS            0x7F  // every day
-
-// ─── Messages ─────────────────────────────────────────────────────────────────
-
-#define WORKER_MSG_SLEEP_DETECTED      0
-#define WORKER_MSG_NAP_NUDGE           1  // gentle nudge request
-#define APP_MSG_SNOOZE_10              10
-#define APP_MSG_SNOOZE_30              11
-#define APP_MSG_DISMISS                12
+#define WORKER_MSG_SLEEP_DETECTED        0
+#define WORKER_MSG_NAP_NUDGE             1
+#define APP_MSG_SNOOZE_10               10
+#define APP_MSG_SNOOZE_30               11
+#define APP_MSG_DISMISS                 12
 #define APP_MSG_SETTINGS_CHANGED       13
 
-// ─── Tier-1 Constants ─────────────────────────────────────────────────────────
+#define WARM_LEAD_HOURS                  2
+#define HR_ARMED_PERIOD_SECS           120
+#define HR_CONFIRM_PERIOD_SECS          20
+#define HRV_CONFIRM_PERIOD_SECS         20
+#define SENSOR_RETRY_SECS              300
 
-#define HR_BUF_SIZE           3       // smoothing buffer (~6 min at boosted 120s cadence)
-#define VMC_STILL_THRESH      100     // VMC below this = still enough to be asleep
-#define VMC_BASELINE_MIN      50      // VMC needed for a DOWNWARD baseline update / seed
-#define VMC_BASELINE_MAX      400     // VMC at/above this = exercising, baseline frozen
-#define VMC_EMA_ALPHA         4       // VMC EMA weight
-#define VMC_LOOKBACK_MIN      10      // minutes of minute-history searched for a valid VMC
-#define BASELINE_MIN_BPM      40      // sanity clamp for the awake baseline
-#define BASELINE_MAX_BPM      120
-#define HR_BOOST_PERIOD_SECS  120     // in-window HR sample period request
-#define WARM_LEAD_HOURS       2       // subscribe/analyze this long before window open too
+#define MOTION_WINDOW_MINUTES            5
+#define MOTION_QUIET_VMC_MAX           100
+#define NUDGE_COOLDOWN_SECS             600
+#define DISMISS_COOLDOWN_SECS           600
+#define SNOOZE_MAX_SECS                7200
+#define ALARM_STALE_SECS               1800
+#define LAUNCH_PENDING_SECS             300
 
-// ─── HRV (PPI) Constants — SDK 4.33+, Pebble Time 2 hardware ────────────────
-// HRV shares the HR sensor subscription (driven at the shorter period), so an
-// equal period means the sensor fires no more often than the HR boost alone.
-#define HRV_PERIOD_SECS       120     // in-window HRV sample period request
-#define BURST_GAP_SECS        10      // PPIs closer together than this = one sensor burst
-#define HRV_BUF_SIZE          8       // accepted-PPI ring (~16 min at 120 s)
-#define HRV_MIN_SAMPLES       5       // spread needs at least this many PPIs
-#define HRV_STALE_SECS        900     // ring unusable if newest PPI older than this
-#define PPI_MIN_MS            300     // artifact gate: >200 bpm is not a resting beat
-#define PPI_MAX_MS            2000    // artifact gate: <30 bpm is not a real beat
-#define PPI_HR_TOLERANCE_PCT  40      // reject PPI >±40% off the HR-implied interval
-#define HRV_BASELINE_MIN_MS   5       // sanity clamp for the awake-spread baseline
-#define HRV_BASELINE_MAX_MS   200
-#define AWAKE_HR_PCT          95      // smoothed HR ≥95% of baseline = clearly awake
-#define HRV_QUIET_VMC         200     // PPIs only trustworthy with a reasonably quiet wrist
+#define PPI_RING_SIZE                    32
+#define PPI_MIN_SAMPLES                   4
+#define PPI_MIN_MS                      300
+#define PPI_MAX_MS                     2000
+#define PPI_HR_TOLERANCE_PCT             40
+#define PPI_CONTIGUOUS_GAP_SECS           3
+#define PPI_FRESH_SECS                   60
 
-// Two-stage wake: counts AND sustained time both required (cadence-independent)
-#define NUDGE_MIN_COUNT       2
-#define NUDGE_AFTER_SECS      240     // ~4 min of sustained evidence → nudge
-#define ALARM_MIN_COUNT       3
-#define ALARM_AFTER_SECS      600     // ~10 min of sustained evidence → full alarm
-#define NUDGE_COOLDOWN_SECS   600     // at most one nudge per 10 min
-#define DISMISS_COOLDOWN_SECS 600     // after a dismiss, no nudge/alarm for 10 min
+// PERSIST_KEY_WORKER_STATUS bitfield.
+#define WORKER_STATUS_RUNNING          (1 << 0)
+#define WORKER_STATUS_HEALTH           (1 << 1)
+#define WORKER_STATUS_HR_CAPABLE       (1 << 2)
+#define WORKER_STATUS_HR_ACTIVE        (1 << 3)
+#define WORKER_STATUS_HRV_ACTIVE       (1 << 4)
+#define WORKER_STATUS_MOTION_FRESH     (1 << 5)
+#define WORKER_STATUS_BASELINE_READY   (1 << 6)
 
-// Stuck-state watchdogs. Both flags below are set by us or the foreground and
-// cleared by an acknowledgement that can be lost (app killed, exited via BACK
-// before v2.4.1, message dropped). Left stuck, either one silently disables
-// detection forever — so both expire.
-#define ALARM_STALE_SECS      1800    // "alarming" longer than 30 min = stale flag
-#define LAUNCH_PENDING_SECS   300     // launch unacknowledged after 5 min = failed
+static NapDetector s_detector;
+static uint16_t s_saved_baseline;
+static int s_last_written_status = -1;
+static int s_last_written_phase = -1;
+static int s_last_written_rmssd = -32768;
+static time_t s_last_telemetry_time;
 
-#define SAMPLE_INTERVAL_MS    300000  // 5 minutes (fallback timer)
-#define SAMPLE_INTERVAL_SECS  300
-#define WINDOW_CHECK_MS       60000   // 1 minute window boundary check
+static bool s_health_subscribed;
+static bool s_hr_capable;
+static bool s_window_active;
+static bool s_last_motion_fresh;
 
-// ─── State ────────────────────────────────────────────────────────────────────
+static uint16_t s_hr_period;
+static uint16_t s_hrv_period;
+static time_t s_hr_retry_after;
+static time_t s_hrv_retry_after;
 
-// True once worker_launch_app() called and haven't gotten a dismiss/awake yet
-static bool s_launch_pending    = false;
-// When that launch was requested, so an unacknowledged one can expire
-static time_t s_launch_pending_time = 0;
+static bool s_launch_pending;
+static time_t s_launch_pending_time;
+static time_t s_last_nudge_time;
+static bool s_observed_alarming;
 
-// True when HealthService is currently subscribed
-static bool s_health_subscribed = false;
+static int16_t s_last_hr_bpm;
+static time_t s_last_hr_time;
+static time_t s_last_accepted_hr_time;
+static uint16_t s_ppi_ring[PPI_RING_SIZE];
+static uint8_t s_ppi_count;
+static uint8_t s_ppi_index;
+static time_t s_last_ppi_time;
 
-// True if this platform has usable HR data (runtime-detected, self-healing)
-static bool s_hr_capable        = false;
+static void prv_health_event_handler(HealthEventType event, void *context);
+static void prv_apply_window_state(void);
 
-// True while our boosted HR sample period request is active
-static bool s_hr_boosted        = false;
-
-// True while inside the guard window (drives open/close transitions)
-static bool s_window_active     = false;
-
-// 60-second window boundary timer
-static AppTimer *s_window_timer  = NULL;
-
-// 5-minute Tier-1 fallback sample timer (only armed if s_hr_capable)
-static AppTimer *s_sample_timer  = NULL;
-
-// Tier-1 HR smoothing buffer
-static int16_t  s_hr_buf[HR_BUF_SIZE];
-static uint8_t  s_hr_buf_idx   = 0;
-static uint8_t  s_hr_buf_count = 0;
-
-// Tier-1 streak: consecutive positive cycles + when the run started
-static uint8_t  s_trigger_streak = 0;
-static time_t   s_streak_start   = 0;
-
-// Last nudge time (RAM only — worker is long-lived)
-static time_t   s_last_nudge_time = 0;
-
-// Tier-1 VMC EMA (pre-computed motion from HealthMinuteData)
-static uint32_t s_vmc_ema       = 0;
-
-// Anchored awake HR baseline. Updates upward freely (unless exercising);
-// updates downward only with awake-zone movement. Never chases sleep onset.
-static int16_t  s_hr_awake_baseline = 0;  // 0 = not yet established
-
-// Timestamp of last HealthEventHeartRateUpdate (0 = never)
-static time_t   s_last_hr_event_time = 0;
-
-// ─── HRV state ────────────────────────────────────────────────────────────────
-
-// True once an HRV sample-period request has succeeded (PT2 on SDK 4.33+).
-// Stays false on hardware/firmware without HRV → pure HR-only detection.
-static bool     s_hrv_capable = false;
-
-// True while our HRV sample period request is active
-static bool     s_hrv_boosted = false;
-
-// True once an HRV request was definitively rejected (no HRV hardware or
-// firmware <4.33) — stops per-minute retry/log spam. Cleared only by worker
-// restart, which is when a firmware update could have changed the answer.
-static bool     s_hrv_rejected = false;
-
-// The Goodix driver reports up to 4 adjacent-beat RR intervals per sensor
-// burst, each as its own HealthEventHRVUpdate. Accepted PPIs are accumulated
-// per burst; the ring stores one MEAN PPI per completed burst, so the spread
-// over the ring is a pure inter-burst drift metric (how much average HR
-// wanders between samples) — high awake, collapsing during sleep.
-static uint16_t s_burst_buf[HRV_BUF_SIZE];   // burst-mean PPIs, ms
-static uint8_t  s_burst_idx   = 0;
-static uint8_t  s_burst_count = 0;
-static time_t   s_last_burst_time = 0;
-
-// In-progress burst accumulator (finalized when the next volley starts, or
-// when an analysis cycle finds it older than BURST_GAP_SECS)
-static uint32_t s_cur_burst_sum      = 0;
-static uint8_t  s_cur_burst_n        = 0;
-static time_t   s_cur_burst_start    = 0;
-static uint16_t s_cur_burst_prev_ppi = 0;
-static uint32_t s_cur_burst_rsa_sum  = 0;   // |diff| of adjacent-beat RRs
-static uint8_t  s_cur_burst_rsa_n    = 0;   // (true rMSSD material — logged only)
-
-// Anchored awake drift baseline (ms). Sleep onset LOWERS drift, so down-moves
-// are gated on proof of wakefulness and up-moves need only a quiet wrist
-// (motion-garbage PPIs must not inflate the anchor). 0 = not yet established.
-static int16_t  s_hrv_awake_baseline = 0;
-
-// Last smoothed HR, used to artifact-gate incoming PPIs against the
-// HR-implied beat interval (60000/bpm).
-static int16_t  s_last_smoothed_hr = 0;
-
-// ─── Setting Helpers ──────────────────────────────────────────────────────────
+// Settings and schedule ------------------------------------------------------
 
 static bool prv_get_enabled(void) {
-    if (!persist_exists(PERSIST_KEY_ENABLED)) return DEFAULT_ENABLED;
-    return (bool)persist_read_int(PERSIST_KEY_ENABLED);
+    return !persist_exists(PERSIST_KEY_ENABLED) ||
+           (bool)persist_read_int(PERSIST_KEY_ENABLED);
+}
+
+static int prv_get_hour(int key, int fallback) {
+    int hour = persist_exists(key) ? persist_read_int(key) : fallback;
+    return (hour >= 0 && hour <= 23) ? hour : fallback;
 }
 
 static int prv_get_start_hour(void) {
-    if (!persist_exists(PERSIST_KEY_START_HOUR)) return DEFAULT_START_HOUR;
-    return persist_read_int(PERSIST_KEY_START_HOUR);
+    return prv_get_hour(PERSIST_KEY_START_HOUR, DEFAULT_START_HOUR);
 }
 
 static int prv_get_end_hour(void) {
-    if (!persist_exists(PERSIST_KEY_END_HOUR)) return DEFAULT_END_HOUR;
-    return persist_read_int(PERSIST_KEY_END_HOUR);
+    return prv_get_hour(PERSIST_KEY_END_HOUR, DEFAULT_END_HOUR);
 }
 
-/**
- * Return the HR-drop threshold percentage based on persisted sensitivity.
- *
- * Bumped up (bigger required drop) from the original 8/13/20% — normal
- * resting relaxation (sitting/lying still, reading, watching TV) commonly
- * drops HR 10-15% below an "active" baseline via vagal tone without being
- * sleep onset. The old thresholds were catching that as a nap.
- */
-static int prv_get_hr_drop_pct(void) {
-    int level = persist_exists(PERSIST_KEY_SENSITIVITY)
-                ? persist_read_int(PERSIST_KEY_SENSITIVITY)
-                : DEFAULT_SENSITIVITY;
-    switch (level) {
-        case 0: return 90;  // Sensitive:     10% drop
-        case 2: return 76;  // Conservative: 24% drop
-        default: return 84; // Balanced:     16% drop
+static uint8_t prv_get_active_days(void) {
+    uint8_t days = persist_exists(PERSIST_KEY_ACTIVE_DAYS)
+                       ? (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS)
+                       : DEFAULT_ACTIVE_DAYS;
+    days &= 0x7F;
+    return days == 0 ? DEFAULT_ACTIVE_DAYS : days;
+}
+
+static NapDetectorSensitivity prv_get_sensitivity(void) {
+    int value = persist_exists(PERSIST_KEY_SENSITIVITY)
+                    ? persist_read_int(PERSIST_KEY_SENSITIVITY)
+                    : DEFAULT_SENSITIVITY;
+    if (value == NAP_DETECTOR_SENSITIVE ||
+        value == NAP_DETECTOR_CONSERVATIVE) {
+        return (NapDetectorSensitivity)value;
     }
+    return NAP_DETECTOR_BALANCED;
+}
+
+static bool prv_day_is_active(uint8_t days, int weekday) {
+    return ((days >> weekday) & 1u) != 0;
 }
 
 /**
- * Softer HR threshold used when HRV corroborates: halfway between "no drop"
- * and the full sensitivity drop. Drift suppression appears earlier in the
- * doze-off slide than a full HR drop, so with drift suppressed we accept a
- * milder HR dip. Sensitive: 95, Balanced: 92, Conservative: 88.
+ * A cross-midnight window belongs to the weekday on which it opened. Equal
+ * start/end hours mean all day; the master toggle is how guarding is disabled.
  */
-static int prv_get_hr_soft_pct(void) {
-    return (100 + prv_get_hr_drop_pct()) / 2;
-}
-
-/**
- * Drift-suppression threshold (percent of the awake baseline) for the HRV
- * path: positive when spread ≤ baseline × pct / 100. On-wrist data (PT2):
- * quiet-awake drift ≈ 140–165 ms, dozing/napping ≈ 30 ms — sleep stabilizes
- * average HR, so inter-burst drift collapses. Thresholds leave wide margin.
- */
-static int prv_get_hrv_suppress_pct(void) {
-    int level = persist_exists(PERSIST_KEY_SENSITIVITY)
-                ? persist_read_int(PERSIST_KEY_SENSITIVITY)
-                : DEFAULT_SENSITIVITY;
-    switch (level) {
-        case 0: return 60;  // Sensitive:    ≤60% of awake drift
-        case 2: return 40;  // Conservative: ≤40%
-        default: return 50; // Balanced:     ≤50%
-    }
-}
-
 static bool prv_is_in_window(void) {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-
-    // Active-days bitmask check (bit 0=Sun ... bit 6=Sat).
-    // A stored 0 would mean "never guard" — treat it as corrupt and use default.
-    uint8_t active_days = persist_exists(PERSIST_KEY_ACTIVE_DAYS)
-        ? (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS)
-        : DEFAULT_ACTIVE_DAYS;
-    active_days &= 0x7F;
-    if (active_days == 0) active_days = DEFAULT_ACTIVE_DAYS;
-    if (!((active_days >> t->tm_wday) & 1)) return false;
-
-    int hour  = t->tm_hour;
+    struct tm *local = localtime(&now);
+    int hour = local->tm_hour;
+    int weekday = local->tm_wday;
     int start = prv_get_start_hour();
-    int end   = prv_get_end_hour();
+    int end = prv_get_end_hour();
+    uint8_t days = prv_get_active_days();
 
-    if (start <= end) {
-        return (hour >= start && hour < end);
-    } else {
-        return (hour >= start || hour < end);
+    if (start == end) {
+        return prv_day_is_active(days, weekday);
     }
+    if (start < end) {
+        return hour >= start && hour < end &&
+               prv_day_is_active(days, weekday);
+    }
+    if (hour >= start) {
+        return prv_day_is_active(days, weekday);
+    }
+    if (hour < end) {
+        return prv_day_is_active(days, (weekday + 6) % 7);
+    }
+    return false;
 }
 
-/**
- * True during the WARM_LEAD_HOURS window immediately before the guard window
- * opens, on an active day. Lets HR-capable platforms subscribe/analyze early
- * so the awake baseline is already warm the moment guarding actually starts,
- * without needing a 24/7 subscription the rest of the day.
- */
+/** True during the two hours preceding the next active guard-day start. */
 static bool prv_is_in_lead_period(void) {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
+    struct tm *local = localtime(&now);
+    int hour = local->tm_hour;
+    int weekday = local->tm_wday;
+    int start = prv_get_start_hour();
+    int end = prv_get_end_hour();
+    int lead_start = (start + 24 - WARM_LEAD_HOURS) % 24;
+    int guard_weekday;
+    bool in_lead;
 
-    uint8_t active_days = persist_exists(PERSIST_KEY_ACTIVE_DAYS)
-        ? (uint8_t)persist_read_int(PERSIST_KEY_ACTIVE_DAYS)
-        : DEFAULT_ACTIVE_DAYS;
-    active_days &= 0x7F;
-    if (active_days == 0) active_days = DEFAULT_ACTIVE_DAYS;
-    if (!((active_days >> t->tm_wday) & 1)) return false;
-
-    int hour       = t->tm_hour;
-    int start      = prv_get_start_hour();
-    int lead_start = ((start - WARM_LEAD_HOURS) % 24 + 24) % 24;
-
-    if (lead_start <= start) {
-        return (hour >= lead_start && hour < start);
+    if (start == end) {
+        // An all-day guard starts at midnight, regardless of the stored hour.
+        in_lead = hour >= (24 - WARM_LEAD_HOURS);
+        guard_weekday = (weekday + 1) % 7;
+    } else if (lead_start < start) {
+        in_lead = hour >= lead_start && hour < start;
+        guard_weekday = weekday;
     } else {
-        return (hour >= lead_start || hour < start);
+        // For a midnight/01:00 start, the pre-midnight portion is preparing
+        // tomorrow's guard day; the after-midnight portion prepares today.
+        in_lead = hour >= lead_start || hour < start;
+        guard_weekday = hour >= lead_start ? (weekday + 1) % 7 : weekday;
+    }
+
+    return in_lead && prv_day_is_active(prv_get_active_days(), guard_weekday);
+}
+
+// Persistence and diagnostics -----------------------------------------------
+
+static void prv_migrate_detector_state(void) {
+    if (persist_exists(PERSIST_KEY_DETECTOR_SCHEMA) &&
+        persist_read_int(PERSIST_KEY_DETECTOR_SCHEMA) ==
+            DETECTOR_SCHEMA_VERSION) {
+        return;
+    }
+
+    // The previous baseline and every transient were produced by a different
+    // model and are unsafe to reinterpret. Settings and user alarm state stay.
+    static const int old_keys[] = {
+        PERSIST_KEY_HR_BUFFER,
+        PERSIST_KEY_HR_BUF_IDX,
+        PERSIST_KEY_HR_BUF_COUNT,
+        PERSIST_KEY_TRIGGER_STREAK,
+        PERSIST_KEY_VMC_EMA,
+        PERSIST_KEY_DEBUG_HR,
+        PERSIST_KEY_DEBUG_AVG,
+        PERSIST_KEY_DEBUG_ACCEL,
+        PERSIST_KEY_HR_BASELINE,
+        PERSIST_KEY_NUDGE_PENDING,
+        PERSIST_KEY_STREAK_START,
+        PERSIST_KEY_DEBUG_LAST_TS,
+        PERSIST_KEY_HRV_BASELINE,
+        PERSIST_KEY_DEBUG_HRV,
+        PERSIST_KEY_LAST_NUDGE,
+        PERSIST_KEY_DEBUG_PHASE,
+        PERSIST_KEY_WORKER_STATUS
+    };
+    for (uint8_t i = 0; i < sizeof(old_keys) / sizeof(old_keys[0]); ++i) {
+        persist_delete(old_keys[i]);
+    }
+    persist_write_int(PERSIST_KEY_DETECTOR_SCHEMA,
+                      DETECTOR_SCHEMA_VERSION);
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "NapBuster: detector schema migrated; recalibrating baseline");
+}
+
+static void prv_load_detector_state(void) {
+    nap_detector_init(&s_detector, prv_get_sensitivity());
+    if (persist_exists(PERSIST_KEY_HR_BASELINE)) {
+        int baseline = persist_read_int(PERSIST_KEY_HR_BASELINE);
+        if (baseline >= 40 && baseline <= 180) {
+            nap_detector_restore_baseline(&s_detector, (uint16_t)baseline);
+        }
+    }
+    s_saved_baseline = nap_detector_baseline_bpm(&s_detector);
+
+    if (persist_exists(PERSIST_KEY_LAST_NUDGE)) {
+        s_last_nudge_time = (time_t)persist_read_int(PERSIST_KEY_LAST_NUDGE);
     }
 }
 
-// ─── Guard Helpers ────────────────────────────────────────────────────────────
+static void prv_save_baseline_if_changed(void) {
+    uint16_t baseline = nap_detector_baseline_bpm(&s_detector);
+    if (baseline == s_saved_baseline) {
+        return;
+    }
+    if (baseline == 0) {
+        persist_delete(PERSIST_KEY_HR_BASELINE);
+    } else {
+        persist_write_int(PERSIST_KEY_HR_BASELINE, (int)baseline);
+    }
+    s_saved_baseline = baseline;
+}
+
+static void prv_write_status(void) {
+    int status = WORKER_STATUS_RUNNING;
+    if (s_health_subscribed) status |= WORKER_STATUS_HEALTH;
+    if (s_hr_capable) status |= WORKER_STATUS_HR_CAPABLE;
+    if (s_hr_period != 0) status |= WORKER_STATUS_HR_ACTIVE;
+    if (s_hrv_period != 0) status |= WORKER_STATUS_HRV_ACTIVE;
+    if (s_last_motion_fresh) status |= WORKER_STATUS_MOTION_FRESH;
+    if (nap_detector_baseline_bpm(&s_detector) != 0) {
+        status |= WORKER_STATUS_BASELINE_READY;
+    }
+    if ((int)s_detector.phase != s_last_written_phase) {
+        persist_write_int(PERSIST_KEY_DEBUG_PHASE, (int)s_detector.phase);
+        s_last_written_phase = (int)s_detector.phase;
+    }
+    if (status != s_last_written_status) {
+        persist_write_int(PERSIST_KEY_WORKER_STATUS, status);
+        s_last_written_status = status;
+    }
+}
+
+static void prv_write_rmssd(int rmssd) {
+    if (rmssd == s_last_written_rmssd) return;
+    persist_write_int(PERSIST_KEY_DEBUG_HRV, rmssd);
+    s_last_written_rmssd = rmssd;
+}
+
+static void prv_write_analysis_telemetry(uint16_t smoothed_hr,
+                                         const NapDetectorMotion *motion,
+                                         int rmssd,
+                                         time_t timestamp,
+                                         bool force) {
+    bool phase_changed =
+        (int)s_detector.phase != s_last_written_phase;
+    if (!force && !phase_changed && s_last_telemetry_time > 0 &&
+        timestamp >= s_last_telemetry_time &&
+        (timestamp - s_last_telemetry_time) < SECONDS_PER_MINUTE) {
+        // Candidate analysis can run every 20 seconds. Once-per-minute
+        // diagnostics remain useful without turning every probe into several
+        // persistent-storage writes. Phase/status changes still write now.
+        prv_write_status();
+        return;
+    }
+
+    uint32_t evidence_minutes = s_detector.evidence_seconds / 60u;
+    if (evidence_minutes > 255u) evidence_minutes = 255u;
+
+    persist_write_int(PERSIST_KEY_TRIGGER_STREAK, (int)evidence_minutes);
+    persist_write_int(PERSIST_KEY_DEBUG_HR, (int)smoothed_hr);
+    persist_write_int(PERSIST_KEY_DEBUG_AVG,
+                      (int)nap_detector_baseline_bpm(&s_detector));
+    persist_write_int(PERSIST_KEY_DEBUG_ACCEL,
+                      motion == NULL ? 0 : (int)motion->latest_vmc);
+    persist_write_int(PERSIST_KEY_DEBUG_LAST_TS, (int)timestamp);
+    prv_write_rmssd(rmssd);
+    s_last_telemetry_time = timestamp;
+    prv_write_status();
+}
+
+// Guard/pending-state helpers ------------------------------------------------
 
 static bool prv_is_snoozed(void) {
     if (!persist_exists(PERSIST_KEY_SNOOZE_UNTIL)) return false;
-    time_t snooze_until = (time_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL);
-    if (snooze_until == 0) return false;
-    return time(NULL) < snooze_until;
+    time_t until = (time_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL);
+    time_t now = time(NULL);
+    if (until > now && (until - now) <= SNOOZE_MAX_SECS) return true;
+
+    // Expired, implausibly far-future, or clock-warped values cannot disable
+    // the detector indefinitely.
+    persist_delete(PERSIST_KEY_SNOOZE_UNTIL);
+    return false;
 }
 
-/**
- * True if the foreground currently has an alarm up.
- *
- * A flag with no timestamp (written by a pre-2.4.1 build) or one older than
- * ALARM_STALE_SECS is treated as stale and cleared: no genuine alarm session
- * lasts that long — the user dismisses or snoozes — and before 2.4.1 exiting
- * the alarm screen with BACK left this set forever, which made the worker
- * refuse every subsequent launch while the trigger streak climbed unchecked.
- */
 static bool prv_is_already_alarming(void) {
-    if (!persist_exists(PERSIST_KEY_ALARMING)) return false;
-    if (!persist_read_int(PERSIST_KEY_ALARMING)) return false;
-
-    time_t started = persist_exists(PERSIST_KEY_ALARM_START)
-                     ? (time_t)persist_read_int(PERSIST_KEY_ALARM_START) : 0;
-    time_t now = time(NULL);
-
-    if (started <= 0 || now < started || (now - started) > ALARM_STALE_SECS) {
-        APP_LOG(APP_LOG_LEVEL_WARNING,
-            "NapBuster worker: stale ALARMING flag cleared (age=%lds)",
-            started > 0 ? (long)(now - started) : -1L);
-        persist_write_int(PERSIST_KEY_ALARMING, 0);
-        persist_delete(PERSIST_KEY_ALARM_START);
+    if (!persist_exists(PERSIST_KEY_ALARMING) ||
+        !persist_read_int(PERSIST_KEY_ALARMING)) {
         return false;
     }
-    return true;
+
+    time_t now = time(NULL);
+    time_t started = persist_exists(PERSIST_KEY_ALARM_START)
+                         ? (time_t)persist_read_int(PERSIST_KEY_ALARM_START)
+                         : 0;
+    if (started > 0 && now >= started &&
+        (now - started) <= ALARM_STALE_SECS) {
+        return true;
+    }
+
+    persist_write_int(PERSIST_KEY_ALARMING, 0);
+    persist_delete(PERSIST_KEY_ALARM_START);
+    APP_LOG(APP_LOG_LEVEL_WARNING,
+            "NapBuster: cleared stale alarm state");
+    return false;
 }
 
-/** True within DISMISS_COOLDOWN_SECS of the user dismissing an alarm. */
 static bool prv_dismiss_cooldown_active(void) {
     if (!persist_exists(PERSIST_KEY_LAST_DISMISS)) return false;
     time_t last = (time_t)persist_read_int(PERSIST_KEY_LAST_DISMISS);
     time_t now = time(NULL);
-    if (last <= 0 || now < last) return false;
-    return (now - last) < DISMISS_COOLDOWN_SECS;
+    if (last > 0 && now >= last &&
+        (now - last) < DISMISS_COOLDOWN_SECS) {
+        return true;
+    }
+    persist_delete(PERSIST_KEY_LAST_DISMISS);
+    return false;
 }
 
-// ─── Tier-1 Persist Helpers ──────────────────────────────────────────────────
-
-static void prv_save_hr_state(void) {
-    persist_write_data(PERSIST_KEY_HR_BUFFER, s_hr_buf,
-                       sizeof(int16_t) * HR_BUF_SIZE);
-    persist_write_int(PERSIST_KEY_HR_BUF_IDX,      s_hr_buf_idx);
-    persist_write_int(PERSIST_KEY_HR_BUF_COUNT,    s_hr_buf_count);
-    persist_write_int(PERSIST_KEY_TRIGGER_STREAK,  s_trigger_streak);
-    persist_write_int(PERSIST_KEY_STREAK_START,    (int)s_streak_start);
-    persist_write_int(PERSIST_KEY_VMC_EMA,         (int)s_vmc_ema);
-    persist_write_int(PERSIST_KEY_HR_BASELINE,     (int)s_hr_awake_baseline);
-    persist_write_int(PERSIST_KEY_HRV_BASELINE,    (int)s_hrv_awake_baseline);
+static bool prv_nudge_cooldown_active(void) {
+    time_t now = time(NULL);
+    if (s_last_nudge_time > 0 && now >= s_last_nudge_time &&
+        (now - s_last_nudge_time) < NUDGE_COOLDOWN_SECS) {
+        return true;
+    }
+    if (s_last_nudge_time != 0) {
+        s_last_nudge_time = 0;
+        persist_delete(PERSIST_KEY_LAST_NUDGE);
+    }
+    return false;
 }
 
-static void prv_load_hr_state(void) {
-    if (persist_exists(PERSIST_KEY_HR_BUFFER)) {
-        persist_read_data(PERSIST_KEY_HR_BUFFER, s_hr_buf,
-                          sizeof(int16_t) * HR_BUF_SIZE);
-    }
-    s_hr_buf_idx      = persist_exists(PERSIST_KEY_HR_BUF_IDX)
-                        ? (uint8_t)persist_read_int(PERSIST_KEY_HR_BUF_IDX)     : 0;
-    s_hr_buf_count    = persist_exists(PERSIST_KEY_HR_BUF_COUNT)
-                        ? (uint8_t)persist_read_int(PERSIST_KEY_HR_BUF_COUNT)   : 0;
-    s_trigger_streak  = persist_exists(PERSIST_KEY_TRIGGER_STREAK)
-                        ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
-    s_streak_start    = persist_exists(PERSIST_KEY_STREAK_START)
-                        ? (time_t)persist_read_int(PERSIST_KEY_STREAK_START)    : 0;
-    s_vmc_ema         = persist_exists(PERSIST_KEY_VMC_EMA)
-                        ? (uint32_t)persist_read_int(PERSIST_KEY_VMC_EMA)       : 0;
-    s_hr_awake_baseline = persist_exists(PERSIST_KEY_HR_BASELINE)
-                          ? (int16_t)persist_read_int(PERSIST_KEY_HR_BASELINE) : 0;
-    s_hrv_awake_baseline = persist_exists(PERSIST_KEY_HRV_BASELINE)
-                           ? (int16_t)persist_read_int(PERSIST_KEY_HRV_BASELINE) : 0;
+static void prv_clear_ppi(void);
+static void prv_set_sensor_periods(void);
 
-    // Guard restored values
-    if (s_hr_buf_idx >= HR_BUF_SIZE)   s_hr_buf_idx = 0;
-    if (s_hr_buf_count > HR_BUF_SIZE)  s_hr_buf_count = HR_BUF_SIZE;
-    if (s_trigger_streak > 0 && s_streak_start == 0) s_streak_start = time(NULL);
-    if (s_hr_awake_baseline != 0 &&
-        (s_hr_awake_baseline < BASELINE_MIN_BPM ||
-         s_hr_awake_baseline > BASELINE_MAX_BPM)) {
-        s_hr_awake_baseline = 0;  // re-seed from fresh data
-    }
-    if (s_hrv_awake_baseline != 0 &&
-        (s_hrv_awake_baseline < HRV_BASELINE_MIN_MS ||
-         s_hrv_awake_baseline > HRV_BASELINE_MAX_MS)) {
-        s_hrv_awake_baseline = 0;  // re-seed from fresh data
-    }
-}
-
-static void prv_reset_streak(void) {
-    s_trigger_streak = 0;
-    s_streak_start   = 0;
+static void prv_reset_episode(void) {
+    nap_detector_reset_transient(&s_detector);
+    s_last_accepted_hr_time = 0;
+    s_last_motion_fresh = false;
+    prv_clear_ppi();
+    prv_write_rmssd(-1);
     persist_write_int(PERSIST_KEY_TRIGGER_STREAK, 0);
-    persist_write_int(PERSIST_KEY_STREAK_START,   0);
+    persist_write_int(PERSIST_KEY_DEBUG_PHASE, NAP_DETECTOR_ARMED);
+    s_last_written_phase = NAP_DETECTOR_ARMED;
 }
 
-// ─── HR Capability Probe ──────────────────────────────────────────────────────
+static void prv_reconcile_foreground_state(void) {
+    bool alarming = prv_is_already_alarming();
+    bool paused = prv_is_snoozed() || prv_dismiss_cooldown_active();
 
-/**
- * True if filtered HR data is usable on this watch. Uses a 1-hour lookback:
- * the firmware only implements HR accessibility queries for ranges within its
- * minute-data horizon (2 h), and a range this wide answers "does HR work here"
- * rather than "was there a sample in the last N seconds".
- * Returns false on basalt/chalk (no HRM) and when HR is disabled in settings.
- */
+    if (alarming) {
+        s_observed_alarming = true;
+        s_launch_pending = false;
+        s_launch_pending_time = 0;
+        if (s_detector.phase != NAP_DETECTOR_ARMED) {
+            prv_reset_episode();
+        }
+        return;
+    }
+
+    // Persisted snooze/dismiss state is also an acknowledgement if its worker
+    // message was lost. A true->false ALARMING transition covers foreground
+    // exit paths that clear the flag without leaving either cooldown marker.
+    if (s_observed_alarming || paused) {
+        s_observed_alarming = false;
+        s_launch_pending = false;
+        s_launch_pending_time = 0;
+        if (s_detector.phase != NAP_DETECTOR_ARMED) {
+            prv_reset_episode();
+        }
+    }
+}
+
+static void prv_expire_pending_launches(void) {
+    time_t now = time(NULL);
+    if (s_launch_pending && prv_is_already_alarming()) {
+        // The foreground established a bounded ALARMING session, so the
+        // launch is acknowledged even though no explicit message is needed.
+        s_launch_pending = false;
+        s_launch_pending_time = 0;
+    }
+    bool alarm_expired = s_launch_pending &&
+                         (s_launch_pending_time <= 0 ||
+                          now < s_launch_pending_time ||
+                          (now - s_launch_pending_time) >
+                              LAUNCH_PENDING_SECS);
+    if (alarm_expired) {
+        s_launch_pending = false;
+        s_launch_pending_time = 0;
+        prv_reset_episode();
+        APP_LOG(APP_LOG_LEVEL_WARNING,
+                "NapBuster: unacknowledged alarm launch expired");
+    }
+
+    if (persist_exists(PERSIST_KEY_NUDGE_PENDING)) {
+        bool stale_nudge = s_last_nudge_time <= 0 ||
+                           now < s_last_nudge_time ||
+                           (now - s_last_nudge_time) >
+                               LAUNCH_PENDING_SECS;
+        if (stale_nudge) {
+            persist_delete(PERSIST_KEY_NUDGE_PENDING);
+            prv_reset_episode();
+            APP_LOG(APP_LOG_LEVEL_WARNING,
+                    "NapBuster: unacknowledged nudge launch expired");
+        }
+    }
+}
+
+static bool prv_launch_allowed(bool nudge) {
+    prv_expire_pending_launches();
+    if (s_launch_pending || prv_is_already_alarming() ||
+        prv_is_snoozed() || prv_dismiss_cooldown_active() ||
+        !prv_get_enabled() || !prv_is_in_window()) {
+        return false;
+    }
+    return !nudge || !prv_nudge_cooldown_active();
+}
+
+static bool prv_fire_nudge(void) {
+    if (!prv_launch_allowed(true)) return false;
+
+    s_last_nudge_time = time(NULL);
+    persist_write_int(PERSIST_KEY_LAST_NUDGE, (int)s_last_nudge_time);
+    persist_write_int(PERSIST_KEY_NUDGE_PENDING, 1);
+    AppWorkerMessage message = { .data0 = WORKER_MSG_NAP_NUDGE };
+    app_worker_send_message(WORKER_MSG_NAP_NUDGE, &message);
+    // Deliver directly first if the app is already open. If it is closed the
+    // message is dropped, then the persisted launch kind drives app startup.
+    worker_launch_app();
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: candidate nudge launched");
+    return true;
+}
+
+static bool prv_fire_alarm(void) {
+    if (!prv_launch_allowed(false)) return false;
+
+    persist_delete(PERSIST_KEY_NUDGE_PENDING);
+    s_launch_pending = true;
+    s_launch_pending_time = time(NULL);
+    AppWorkerMessage message = { .data0 = WORKER_MSG_SLEEP_DETECTED };
+    app_worker_send_message(WORKER_MSG_SLEEP_DETECTED, &message);
+    worker_launch_app();
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: full alarm launched");
+    return true;
+}
+
+// Health subscription and dynamic sensor requests ---------------------------
+
 static bool prv_probe_hr_capable(void) {
     time_t now = time(NULL);
-    HealthServiceAccessibilityMask mask =
+    HealthServiceAccessibilityMask raw =
+        health_service_metric_accessible(HealthMetricHeartRateRawBPM,
+                                         now, now);
+    HealthServiceAccessibilityMask filtered =
         health_service_metric_accessible(HealthMetricHeartRateBPM,
                                          now - SECONDS_PER_HOUR, now);
-    return (mask & HealthServiceAccessibilityMaskAvailable) != 0;
+    return ((raw | filtered) & HealthServiceAccessibilityMaskAvailable) != 0;
 }
-
-// ─── HealthService Subscribe / Unsubscribe / Boost ───────────────────────────
-
-static void prv_health_event_handler(HealthEventType event, void *ctx);  // fwd
 
 static void prv_subscribe_health(void) {
     if (s_health_subscribed) return;
-    bool ok = health_service_events_subscribe(prv_health_event_handler, NULL);
-    s_health_subscribed = ok;
-    if (ok) {
-        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: HealthService subscribed");
-    } else {
-        APP_LOG(APP_LOG_LEVEL_WARNING,
-            "NapBuster worker: HealthService unavailable");
-    }
+    s_health_subscribed =
+        health_service_events_subscribe(prv_health_event_handler, NULL);
+    APP_LOG(s_health_subscribed ? APP_LOG_LEVEL_INFO : APP_LOG_LEVEL_WARNING,
+            "NapBuster: HealthService subscribe=%d",
+            (int)s_health_subscribed);
 }
 
 static void prv_unsubscribe_health(void) {
     if (!s_health_subscribed) return;
     health_service_events_unsubscribe();
     s_health_subscribed = false;
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: HealthService unsubscribed");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: HealthService unsubscribed");
 }
 
-/**
- * Request (or cancel) a boosted HR sample period. Only active inside the
- * guard window — this is the one part of NapBuster that spends real battery,
- * and it's what makes ~2-minute detection cadence possible.
- */
-static void prv_set_hr_boost(bool on) {
-    if (!s_hr_capable) return;
-    if (on == s_hr_boosted) return;
-    bool ok = health_service_set_heart_rate_sample_period(
-        on ? HR_BOOST_PERIOD_SECS : 0);
-    s_hr_boosted = on && ok;
-    APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker: HR sample period %s (ok=%d)",
-        on ? "boosted to 120s" : "reset to default", (int)ok);
-}
-
-/**
- * Request (or cancel) the HRV (PPI) sample period. Shares the sensor
- * subscription with the HR period at the shorter of the two intervals —
- * requesting both at 120 s costs no sensor wakeups over the HR boost alone.
- * The request fails on hardware/firmware without HRV (Pebble 2, PebbleOS
- * <4.33); s_hrv_capable latches so detection knows which mode it's in.
- */
-static void prv_set_hrv_boost(bool on) {
-    if (!s_hr_capable) return;
-    if (on && s_hrv_rejected) return;  // hardware said no — stop asking
-    if (on == s_hrv_boosted) return;
-    bool ok = health_service_set_hrv_sample_period(on ? HRV_PERIOD_SECS : 0);
-    s_hrv_boosted = on && ok;
-    if (on) {
-        s_hrv_capable = ok;
-        s_hrv_rejected = !ok;
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker: HRV sample period request %s",
-            ok ? "accepted — HRV-primary detection" : "rejected — HR-only detection");
-    } else {
-        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: HRV sample period reset");
-    }
-}
-
-// ─── HRV: burst-aware PPI ingest + drift spread ──────────────────────────────
-//
-// The Goodix driver delivers up to 4 adjacent-beat RR intervals per sensor
-// burst, one HealthEventHRVUpdate each. Flattening those into a single ring
-// (v2.3.0) mixed two different signals: within-burst variability (respiratory,
-// rises in sleep) and inter-burst HR drift (falls in sleep). The drift term
-// dominates a successive-difference stat, which is why the v2.3.0 "spread"
-// empirically DROPPED during naps. v2.4.0 separates them: each burst reduces
-// to its mean PPI, the ring holds burst means, and the spread over the ring is
-// a clean drift metric. Within-burst variability is logged for future use.
-
-/** Push the completed in-progress burst (if any) into the burst ring. */
-static void prv_finalize_burst(void) {
-    if (s_cur_burst_n == 0) return;
-
-    uint16_t mean = (uint16_t)(s_cur_burst_sum / s_cur_burst_n);
-    s_burst_buf[s_burst_idx] = mean;
-    s_burst_idx = (s_burst_idx + 1) % HRV_BUF_SIZE;
-    if (s_burst_count < HRV_BUF_SIZE) s_burst_count++;
-    s_last_burst_time = time(NULL);
-
-    if (s_cur_burst_rsa_n > 0) {
-        // Adjacent-beat variability inside the burst — true rMSSD material
-        // (rises at sleep onset). Telemetry-only until validated on-wrist.
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster HRV: burst mean=%u ms n=%u rsa=%lu ms (%d bursts)",
-            (unsigned)mean, (unsigned)s_cur_burst_n,
-            (unsigned long)(s_cur_burst_rsa_sum / s_cur_burst_rsa_n),
-            (int)s_burst_count);
-    } else {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster HRV: burst mean=%u ms n=%u (%d bursts)",
-            (unsigned)mean, (unsigned)s_cur_burst_n, (int)s_burst_count);
-    }
-
-    s_cur_burst_sum      = 0;
-    s_cur_burst_n        = 0;
-    s_cur_burst_start    = 0;
-    s_cur_burst_prev_ppi = 0;
-    s_cur_burst_rsa_sum  = 0;
-    s_cur_burst_rsa_n    = 0;
-}
-
-/**
- * Artifact-gate one raw PPI reading and accumulate it into the current burst.
- * The firmware forwards every driver reading with NO quality filtering
- * (quality exists internally but is not exposed), so this gate is our only
- * defense against motion artifacts, poor contact, and off-wrist noise:
- *   1. physiological range 300–2000 ms (30–200 bpm), and
- *   2. within ±PPI_HR_TOLERANCE_PCT of the interval implied by current HR —
- *      wide enough for genuine beat-to-beat variability, tight enough to
- *      reject sensor garbage.
- */
-static void prv_ingest_ppi(uint16_t ppi_ms) {
-    if (ppi_ms < PPI_MIN_MS || ppi_ms > PPI_MAX_MS) {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster HRV: PPI %u ms rejected (out of range)", (unsigned)ppi_ms);
-        return;
-    }
-    if (s_last_smoothed_hr > 0) {
-        int32_t expected = 60000 / s_last_smoothed_hr;
-        int32_t dev = (int32_t)ppi_ms - expected;
-        if (dev < 0) dev = -dev;
-        if (dev * 100 > expected * PPI_HR_TOLERANCE_PCT) {
-            APP_LOG(APP_LOG_LEVEL_DEBUG,
-                "NapBuster HRV: PPI %u ms rejected (HR-implied %ld ms)",
-                (unsigned)ppi_ms, (long)expected);
-            return;
-        }
-    }
-
+static bool prv_request_due(time_t retry_after) {
     time_t now = time(NULL);
+    if (retry_after == 0 || now >= retry_after) return true;
+    // A large backward clock adjustment must not suppress retries forever.
+    return (retry_after - now) > (SENSOR_RETRY_SECS + 60);
+}
 
-    // A gap since the burst started means the previous volley is complete
-    if (s_cur_burst_n > 0 && (now - s_cur_burst_start) > BURST_GAP_SECS) {
-        prv_finalize_burst();
-    }
+static void prv_set_hr_period(uint16_t desired) {
+    if (desired == s_hr_period) return;
+    if (desired != 0 && !prv_request_due(s_hr_retry_after)) return;
 
-    if (s_cur_burst_n == 0) {
-        s_cur_burst_start = now;
+    bool ok = health_service_set_heart_rate_sample_period(desired);
+    if (ok) {
+        s_hr_period = desired;
+        s_hr_retry_after = 0;
+        if (desired != 0) s_hr_capable = true;
     } else {
-        int32_t d = (int32_t)ppi_ms - (int32_t)s_cur_burst_prev_ppi;
-        if (d < 0) d = -d;
-        s_cur_burst_rsa_sum += (uint32_t)d;
-        s_cur_burst_rsa_n++;
+        s_hr_retry_after = time(NULL) + SENSOR_RETRY_SECS;
     }
-    s_cur_burst_sum += ppi_ms;
-    s_cur_burst_n++;
-    s_cur_burst_prev_ppi = ppi_ms;
+    APP_LOG(ok ? APP_LOG_LEVEL_INFO : APP_LOG_LEVEL_WARNING,
+            "NapBuster: HR period=%u accepted=%d",
+            (unsigned)desired, (int)ok);
 }
 
-/**
- * Drift spread: mean absolute successive difference (ms) over the burst-mean
- * ring in chronological order — how much average HR wanders between sensor
- * bursts. High while awake (posture, cognition, micro-arousals keep HR
- * moving); collapses during sleep. Returns -1 when there aren't enough fresh
- * bursts. Finalizes a lingering in-progress burst first so analysis cycles
- * always see the newest complete volley.
- */
-static int prv_compute_ppi_spread(void) {
-    if (s_cur_burst_n > 0 &&
-        (time(NULL) - s_cur_burst_start) > BURST_GAP_SECS) {
-        prv_finalize_burst();
-    }
+static void prv_set_hrv_period(uint16_t desired) {
+    if (desired == s_hrv_period) return;
+    if (desired != 0 && !prv_request_due(s_hrv_retry_after)) return;
 
-    if (s_burst_count < HRV_MIN_SAMPLES) return -1;
-    if (s_last_burst_time == 0 ||
-        (time(NULL) - s_last_burst_time) > HRV_STALE_SECS) return -1;
-
-    uint8_t start = (s_burst_count == HRV_BUF_SIZE) ? s_burst_idx : 0;
-    int32_t sum = 0;
-    for (uint8_t i = 1; i < s_burst_count; i++) {
-        int32_t a = s_burst_buf[(uint8_t)((start + i - 1) % HRV_BUF_SIZE)];
-        int32_t b = s_burst_buf[(uint8_t)((start + i) % HRV_BUF_SIZE)];
-        int32_t d = b - a;
-        if (d < 0) d = -d;
-        sum += d;
-    }
-    return (int)(sum / (s_burst_count - 1));
-}
-
-// ─── Launch Logic ─────────────────────────────────────────────────────────────
-
-/** Launch the foreground alarm if every guard passes. Returns true if launched. */
-static bool prv_try_launch_foreground(void) {
-    // An unacknowledged launch (app never came up, or came up and died without
-    // sending a dismiss) must not block detection indefinitely.
-    if (s_launch_pending && s_launch_pending_time > 0 &&
-        (time(NULL) - s_launch_pending_time) > LAUNCH_PENDING_SECS) {
-        APP_LOG(APP_LOG_LEVEL_WARNING,
-            "NapBuster worker: launch unacknowledged for %ds — retrying",
-            (int)(time(NULL) - s_launch_pending_time));
-        s_launch_pending = false;
-    }
-    if (s_launch_pending)              return false;
-    if (prv_is_already_alarming())     return false;
-    if (prv_is_snoozed())              return false;
-    if (prv_dismiss_cooldown_active()) return false;
-    if (!prv_get_enabled())            return false;
-    if (!prv_is_in_window())           return false;
-
-    APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker: sleep detected in no-nap window — launching app");
-
-    // A pending nudge flag must not downgrade this launch to a double pulse
-    persist_delete(PERSIST_KEY_NUDGE_PENDING);
-
-    s_launch_pending = true;
-    s_launch_pending_time = time(NULL);
-    worker_launch_app();
-
-    // If app is already in foreground, also send a direct message
-    AppWorkerMessage msg = { .data0 = WORKER_MSG_SLEEP_DETECTED };
-    app_worker_send_message(WORKER_MSG_SLEEP_DETECTED, &msg);
-    return true;
-}
-
-/** Launch the foreground in nudge mode (double pulse, no alarm). */
-static void prv_fire_nudge(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster Tier1: firing nudge");
-    persist_write_int(PERSIST_KEY_NUDGE_PENDING, 1);
-    worker_launch_app();
-    AppWorkerMessage nudge_msg = { .data0 = WORKER_MSG_NAP_NUDGE };
-    app_worker_send_message(WORKER_MSG_NAP_NUDGE, &nudge_msg);
-}
-
-// ─── Tier-1 Analysis (shared by HR event path and fallback timer) ─────────────
-
-/**
- * Core Tier-1 analysis, called with a fresh HR reading (0 = unavailable).
- *
- * Requires BOTH a valid HR value and a valid VMC minute record; otherwise the
- * cycle is skipped and all detection state stays frozen. Resetting on missing
- * data was the v5 bug that made the full alarm nearly impossible to reach.
- */
-static void prv_run_tier1_analysis(int16_t hr_val) {
-    time_t now = time(NULL);
-
-    // ── 1. Newest valid VMC from minute history ──────────────────────────────
-    // Minute records can lag or be invalid; search back up to VMC_LOOKBACK_MIN.
-    uint32_t current_vmc = 0;
-    bool vmc_valid = false;
-    HealthMinuteData minute_data[VMC_LOOKBACK_MIN];
-    time_t start_time = now - (VMC_LOOKBACK_MIN * SECONDS_PER_MINUTE);
-    time_t end_time   = now;
-    uint32_t num_records = health_service_get_minute_history(
-        minute_data, VMC_LOOKBACK_MIN, &start_time, &end_time);
-    for (int i = (int)num_records - 1; i >= 0; i--) {
-        if (!minute_data[i].is_invalid) {
-            current_vmc = minute_data[i].vmc;
-            vmc_valid = true;
-            break;
-        }
-    }
-
-    if (hr_val <= 0 || !vmc_valid) {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: cycle skipped (hr=%d vmc_valid=%d) — state frozen",
-            (int)hr_val, (int)vmc_valid);
-        return;
-    }
-
-    // ── 2. Update VMC EMA ─────────────────────────────────────────────────────
-    if (s_vmc_ema == 0) {
-        s_vmc_ema = current_vmc;
+    bool ok = health_service_set_hrv_sample_period(desired);
+    if (ok) {
+        s_hrv_period = desired;
+        s_hrv_retry_after = 0;
     } else {
-        s_vmc_ema = (s_vmc_ema * (VMC_EMA_ALPHA - 1) + current_vmc) / VMC_EMA_ALPHA;
+        s_hrv_retry_after = time(NULL) + SENSOR_RETRY_SECS;
     }
-
-    // ── 3. Stillness: current minute OR the smoothed trend below threshold ───
-    // The EMA term lets the streak survive a single restless minute mid-nap
-    // (rolling over) without opening the gate during steady awake movement.
-    bool still = (current_vmc < VMC_STILL_THRESH) ||
-                 (s_vmc_ema   < VMC_STILL_THRESH);
-
-    // ── 4. HR smoothing buffer ────────────────────────────────────────────────
-    s_hr_buf[s_hr_buf_idx] = hr_val;
-    s_hr_buf_idx = (s_hr_buf_idx + 1) % HR_BUF_SIZE;
-    if (s_hr_buf_count < HR_BUF_SIZE) s_hr_buf_count++;
-
-    int32_t sum = 0;
-    for (uint8_t i = 0; i < s_hr_buf_count; i++) sum += s_hr_buf[i];
-    int16_t smoothed_hr = (int16_t)(sum / s_hr_buf_count);
-    s_last_smoothed_hr = smoothed_hr;  // used to artifact-gate incoming PPIs
-
-    // ── 5. Anchored awake baseline (asymmetric update) ────────────────────────
-    // Up-moves are always safe (can't be sleep-onset chasing) unless we're
-    // exercising, which would inflate the anchor. Down-moves need awake-zone
-    // movement so the baseline never follows HR down into a nap.
-    if (s_hr_awake_baseline == 0) {
-        if (current_vmc >= VMC_BASELINE_MIN) {
-            s_hr_awake_baseline = smoothed_hr;
-            APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster Tier1: awake baseline seeded at %d BPM (vmc=%u)",
-                (int)s_hr_awake_baseline, (unsigned)current_vmc);
-        }
-    } else if (current_vmc >= VMC_BASELINE_MAX) {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: baseline frozen (vmc=%u — exercising)",
-            (unsigned)current_vmc);
-    } else if (smoothed_hr >= s_hr_awake_baseline ||
-               current_vmc >= VMC_BASELINE_MIN) {
-        s_hr_awake_baseline =
-            (int16_t)((s_hr_awake_baseline * 7 + smoothed_hr) / 8);
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: baseline -> %d (hr=%d vmc=%u)",
-            (int)s_hr_awake_baseline, (int)smoothed_hr, (unsigned)current_vmc);
-    } else {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: baseline frozen (vmc=%u below %d and HR dropping)",
-            (unsigned)current_vmc, VMC_BASELINE_MIN);
+    if (desired == 0 || s_hrv_period == 0) {
+        prv_clear_ppi();
+        prv_write_rmssd(-1);
     }
+    APP_LOG(ok ? APP_LOG_LEVEL_INFO : APP_LOG_LEVEL_DEBUG,
+            "NapBuster: HRV period=%u accepted=%d",
+            (unsigned)desired, (int)ok);
+}
 
-    if (s_hr_awake_baseline != 0) {
-        if (s_hr_awake_baseline < BASELINE_MIN_BPM) s_hr_awake_baseline = BASELINE_MIN_BPM;
-        if (s_hr_awake_baseline > BASELINE_MAX_BPM) s_hr_awake_baseline = BASELINE_MAX_BPM;
+static void prv_set_sensor_periods(void) {
+    bool confirming = s_detector.phase != NAP_DETECTOR_ARMED;
+    uint16_t desired_hr = 0;
+    uint16_t desired_hrv = 0;
+
+    if (s_window_active && s_health_subscribed) {
+        // A successful period request is also the reliable fresh-install
+        // hardware probe; accessibility may have no recent HR to report yet.
+        desired_hr = confirming ? HR_CONFIRM_PERIOD_SECS
+                                : HR_ARMED_PERIOD_SECS;
+        desired_hrv = confirming && s_hr_capable
+                          ? HRV_CONFIRM_PERIOD_SECS
+                          : 0;
     }
+    prv_set_hr_period(desired_hr);
+    prv_set_hrv_period(desired_hrv);
+    prv_write_status();
+}
 
-    // ── 5b. Drift spread + anchored awake-drift baseline ──────────────────────
-    // Sleep onset LOWERS drift, so DOWN is the dangerous direction: down-moves
-    // only happen while HR proves wakefulness (v2.3.0 had this mirrored, and
-    // the baseline chased the user into their doze). Up-moves are safe from
-    // sleep-chasing but need a quiet wrist so motion-garbage PPIs can't
-    // inflate the anchor.
-    int spread = prv_compute_ppi_spread();
-    if (spread >= 0 && s_hr_awake_baseline > 0) {
-        bool clearly_awake =
-            ((int32_t)smoothed_hr * 100 >=
-             (int32_t)s_hr_awake_baseline * AWAKE_HR_PCT) &&
-            (current_vmc < HRV_QUIET_VMC);
+// Candidate-only, diagnostic HRV --------------------------------------------
 
-        if (s_hrv_awake_baseline == 0) {
-            if (clearly_awake) {
-                s_hrv_awake_baseline = (int16_t)spread;
-                APP_LOG(APP_LOG_LEVEL_INFO,
-                    "NapBuster HRV: awake drift baseline seeded at %d ms", spread);
-            }
-        } else if ((spread >= s_hrv_awake_baseline &&
-                    current_vmc < HRV_QUIET_VMC) ||
-                   clearly_awake) {
-            s_hrv_awake_baseline =
-                (int16_t)((s_hrv_awake_baseline * 7 + spread) / 8);
-        }
+static void prv_clear_ppi(void) {
+    memset(s_ppi_ring, 0, sizeof(s_ppi_ring));
+    s_ppi_count = 0;
+    s_ppi_index = 0;
+    s_last_ppi_time = 0;
+}
 
-        if (s_hrv_awake_baseline != 0) {
-            if (s_hrv_awake_baseline < HRV_BASELINE_MIN_MS)
-                s_hrv_awake_baseline = HRV_BASELINE_MIN_MS;
-            if (s_hrv_awake_baseline > HRV_BASELINE_MAX_MS)
-                s_hrv_awake_baseline = HRV_BASELINE_MAX_MS;
-        }
-    }
-
-    // ── 6. Trigger evaluation ─────────────────────────────────────────────────
-    if (s_hr_awake_baseline > 0 && s_hr_buf_count >= 2) {
-        int drop_pct = prv_get_hr_drop_pct();
-        bool hr_drop_full =
-            ((int32_t)smoothed_hr * 100) < ((int32_t)s_hr_awake_baseline * drop_pct);
-
-        // HRV-primary path: suppressed inter-burst drift (average HR gone
-        // metronomic — the earliest observable sign of the doze-off slide)
-        // plus a mild HR dip fires earlier than the full HR drop. The
-        // full-drop path stays live as insurance for naps where the drift
-        // signal is missing or the baseline is still warming up.
-        bool hrv_ready = (spread >= 0 && s_hrv_awake_baseline > 0);
-        bool hrv_positive = false;
-        if (hrv_ready) {
-            bool hrv_suppressed =
-                (int32_t)spread * 100 <=
-                (int32_t)s_hrv_awake_baseline * prv_get_hrv_suppress_pct();
-            bool hr_soft_drop =
-                ((int32_t)smoothed_hr * 100) <
-                ((int32_t)s_hr_awake_baseline * prv_get_hr_soft_pct());
-            hrv_positive = hrv_suppressed && hr_soft_drop;
-        }
-
-        bool positive = still && (hrv_positive || hr_drop_full);
-
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: hr=%d smoothed=%d base=%d vmc=%u still=%d "
-            "drop=%d spread=%d hrvbase=%d hrv+=%d",
-            (int)hr_val, (int)smoothed_hr, (int)s_hr_awake_baseline,
-            (unsigned)current_vmc, (int)still, (int)hr_drop_full,
-            spread, (int)s_hrv_awake_baseline, (int)hrv_positive);
-
-        if (positive) {
-            if (s_trigger_streak == 0) s_streak_start = now;
-            if (s_trigger_streak < 255) s_trigger_streak++;
-            int sustained = (int)(now - s_streak_start);
-
-            APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster Tier1: streak=%d sustained=%ds (nudge %ds, alarm %ds)",
-                (int)s_trigger_streak, sustained, NUDGE_AFTER_SECS, ALARM_AFTER_SECS);
-
-            if (s_trigger_streak >= ALARM_MIN_COUNT &&
-                sustained >= ALARM_AFTER_SECS) {
-                // Full alarm. Only consume the streak if the launch actually
-                // happened — otherwise (e.g. outside window) keep accumulating
-                // so a pre-window nap alarms the moment the window opens.
-                if (prv_try_launch_foreground()) {
-                    prv_reset_streak();
-                }
-            } else if (s_trigger_streak >= NUDGE_MIN_COUNT &&
-                       sustained >= NUDGE_AFTER_SECS &&
-                       (now - s_last_nudge_time) >= NUDGE_COOLDOWN_SECS &&
-                       !s_launch_pending &&
-                       !prv_is_already_alarming() &&
-                       !prv_is_snoozed() &&
-                       !prv_dismiss_cooldown_active() &&
-                       prv_get_enabled() &&
-                       prv_is_in_window()) {
-                s_last_nudge_time = now;
-                prv_fire_nudge();
-            }
+static uint32_t prv_integer_sqrt(uint32_t value) {
+    uint32_t result = 0;
+    uint32_t bit = 1UL << 30;
+    while (bit > value) bit >>= 2;
+    while (bit != 0) {
+        if (value >= result + bit) {
+            value -= result + bit;
+            result = (result >> 1) + bit;
         } else {
-            if (s_trigger_streak > 0) {
-                APP_LOG(APP_LOG_LEVEL_INFO,
-                    "NapBuster Tier1: streak reset by awake evidence (drop=%d hrv+=%d still=%d)",
-                    (int)hr_drop_full, (int)hrv_positive, (int)still);
-            }
-            s_trigger_streak = 0;
-            s_streak_start   = 0;
+            result >>= 1;
         }
-    } else {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: warming up (base=%d buf=%d)",
-            (int)s_hr_awake_baseline, (int)s_hr_buf_count);
+        bit >>= 2;
+    }
+    return result;
+}
+
+static int prv_current_rmssd(void) {
+    time_t now = time(NULL);
+    if (s_ppi_count < PPI_MIN_SAMPLES || s_last_ppi_time <= 0 ||
+        now < s_last_ppi_time ||
+        (now - s_last_ppi_time) > PPI_FRESH_SECS) {
+        return -1;
     }
 
-    // ── 7. Telemetry + persist ────────────────────────────────────────────────
-    persist_write_int(PERSIST_KEY_DEBUG_HR,      (int)smoothed_hr);
-    persist_write_int(PERSIST_KEY_DEBUG_AVG,     (int)s_hr_awake_baseline);
-    persist_write_int(PERSIST_KEY_DEBUG_ACCEL,   (int)current_vmc);
-    persist_write_int(PERSIST_KEY_DEBUG_HRV,     spread);
-    persist_write_int(PERSIST_KEY_DEBUG_LAST_TS, (int)now);
-    prv_save_hr_state();
-}
-
-// ─── Tier-1 Fallback Sample Timer ────────────────────────────────────────────
-
-static void prv_sample_timer_callback(void *ctx);  // fwd
-
-static void prv_start_sample_timer(void) {
-    if (s_sample_timer) return;
-    s_sample_timer = app_timer_register(SAMPLE_INTERVAL_MS,
-                                        prv_sample_timer_callback, NULL);
-}
-
-static void prv_stop_sample_timer(void) {
-    if (s_sample_timer) {
-        app_timer_cancel(s_sample_timer);
-        s_sample_timer = NULL;
+    uint8_t start = s_ppi_count == PPI_RING_SIZE ? s_ppi_index : 0;
+    uint32_t squared_sum = 0;
+    for (uint8_t i = 1; i < s_ppi_count; ++i) {
+        int32_t current =
+            s_ppi_ring[(uint8_t)((start + i) % PPI_RING_SIZE)];
+        int32_t previous =
+            s_ppi_ring[(uint8_t)((start + i - 1) % PPI_RING_SIZE)];
+        int32_t difference = current - previous;
+        squared_sum += (uint32_t)(difference * difference);
     }
+    return (int)prv_integer_sqrt(squared_sum / (s_ppi_count - 1));
 }
 
-/**
- * Fallback timer — fires every 5 minutes while subscribed (guard window or
- * the WARM_LEAD_HOURS lead-in), stopped entirely the rest of the day.
- * Skips entirely if a HealthEventHeartRateUpdate ran analysis recently, which
- * inside the window (boosted 120 s events) is essentially always.
- * peek_current_value returns 0 for samples older than 15 min — a zero here
- * just skips the cycle, it no longer resets detection state.
- */
-static void prv_sample_timer_callback(void *ctx) {
-    s_sample_timer = NULL;
+static void prv_ingest_ppi(uint16_t ppi_ms) {
+    if (s_detector.phase == NAP_DETECTOR_ARMED || s_hrv_period == 0 ||
+        ppi_ms < PPI_MIN_MS || ppi_ms > PPI_MAX_MS) {
+        return;
+    }
 
     time_t now = time(NULL);
-    bool had_recent_event = (s_last_hr_event_time > 0) &&
-                            (now - s_last_hr_event_time < SAMPLE_INTERVAL_SECS);
-
-    if (had_recent_event) {
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1 timer: HR event ran analysis %ds ago — skipping",
-            (int)(now - s_last_hr_event_time));
-    } else {
-        HealthValue peeked =
-            health_service_peek_current_value(HealthMetricHeartRateBPM);
-        int16_t hr_val = (peeked > 0) ? (int16_t)peeked : 0;
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1 timer: no recent HR event — peeked BPM=%d",
-            (int)hr_val);
-        prv_run_tier1_analysis(hr_val);
+    if (s_last_hr_bpm > 0 && s_last_hr_time > 0 && now >= s_last_hr_time &&
+        (now - s_last_hr_time) <= 60) {
+        int32_t expected = 60000 / s_last_hr_bpm;
+        int32_t difference = (int32_t)ppi_ms - expected;
+        if (difference < 0) difference = -difference;
+        if (difference * 100 > expected * PPI_HR_TOLERANCE_PCT) return;
     }
 
-    prv_start_sample_timer();  // re-arm
+    if (s_last_ppi_time > 0 &&
+        (now < s_last_ppi_time ||
+         (now - s_last_ppi_time) > PPI_CONTIGUOUS_GAP_SECS)) {
+        prv_clear_ppi();
+    }
+
+    s_ppi_ring[s_ppi_index] = ppi_ms;
+    s_ppi_index = (uint8_t)((s_ppi_index + 1) % PPI_RING_SIZE);
+    if (s_ppi_count < PPI_RING_SIZE) ++s_ppi_count;
+    s_last_ppi_time = now;
 }
 
-// ─── Window State Machine ─────────────────────────────────────────────────────
+// Completed-minute motion summary -------------------------------------------
 
-/**
- * Reconcile subscriptions, timers and the HR boost with the current window
- * state. Called at init, on every 60 s boundary tick, and on settings changes.
- */
-static void prv_apply_window_state(void) {
-    bool enabled    = prv_get_enabled();
-    bool in_window  = enabled && prv_is_in_window();
-    bool was_active = s_window_active;
-    s_window_active = in_window;
+static bool prv_minute_overlaps_own_nudge(time_t record_start,
+                                           time_t record_end) {
+    if (s_last_nudge_time <= 0) return false;
+    return s_last_nudge_time >= record_start &&
+           s_last_nudge_time < record_end;
+}
 
-    // Subscribe during the guard window itself, plus a WARM_LEAD_HOURS lead-in
-    // beforehand on HR-capable platforms (so the awake baseline is already
-    // warm the moment guarding starts). Outside both, fully unsubscribe — no
-    // more 24/7 always-on subscription burning battery all day.
-    bool in_lead      = enabled && s_hr_capable && !in_window && prv_is_in_lead_period();
-    bool want_health  = in_window || in_lead;
+static NapDetectorMotion prv_get_motion_summary(time_t now) {
+    NapDetectorMotion motion;
+    memset(&motion, 0, sizeof(motion));
 
-    if (want_health) {
-        prv_subscribe_health();
-    } else {
-        prv_unsubscribe_health();
-    }
+    HealthMinuteData records[MOTION_WINDOW_MINUTES];
+    time_t completed_end = now - (now % SECONDS_PER_MINUTE);
+    time_t returned_start =
+        completed_end - MOTION_WINDOW_MINUTES * SECONDS_PER_MINUTE;
+    time_t returned_end = completed_end;
+    uint32_t count = health_service_get_minute_history(
+        records, MOTION_WINDOW_MINUTES, &returned_start, &returned_end);
+    if (count > MOTION_WINDOW_MINUTES) count = MOTION_WINDOW_MINUTES;
 
-    // Fallback timer only needed while actually subscribed for Tier 1
-    // (window or lead-in) — no reason to wake every 5 min the rest of the day.
-    if (s_hr_capable && want_health) {
-        prv_start_sample_timer();
-    } else {
-        prv_stop_sample_timer();
-    }
+    uint32_t vmc_sum = 0;
+    uint32_t steps_sum = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        time_t record_end =
+            returned_start + (time_t)(i + 1) * SECONDS_PER_MINUTE;
+        time_t record_start = record_end - SECONDS_PER_MINUTE;
+        if (record_end > completed_end || records[i].is_invalid) continue;
 
-    // Boosted 120 s HR sampling only while actually guarding.
-    // HRV rides the same sensor subscription at the same period — no extra
-    // sensor wakeups — and is likewise only requested while guarding.
-    prv_set_hr_boost(in_window);
-    prv_set_hrv_boost(in_window);
+        uint32_t vmc = records[i].vmc;
+        uint32_t steps = records[i].steps;
 
-    if (in_window && !was_active) {
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker: window opened (baseline=%d, buf=%d)",
-            (int)s_hr_awake_baseline, (int)s_hr_buf_count);
-
-        // Immediate Tier-2 check in case we entered the window already asleep
-        HealthActivityMask acts = health_service_peek_current_activities();
-        if ((acts & HealthActivitySleep) || (acts & HealthActivityRestfulSleep)) {
-            prv_try_launch_foreground();
+        // The nudge is our actuator, not evidence that the user woke. Mask its
+        // exact minute. The core accepts four valid minutes, so omitting this
+        // record does not itself break continuity. Genuine movement in any
+        // following minute still resets the detector. Step counts are kept:
+        // the vibration can raise VMC, but it cannot make the wearer walk.
+        bool own_nudge =
+            prv_minute_overlaps_own_nudge(record_start, record_end);
+        if (own_nudge) {
+            steps_sum += steps;
+            if ((uint32_t)record_end >= motion.latest_timestamp) {
+                motion.latest_timestamp = (uint32_t)record_end;
+                motion.latest_vmc = 0;
+                motion.latest_steps =
+                    steps > 65535u ? 65535u : (uint16_t)steps;
+            }
+            continue;
         }
-    } else if (!in_window && was_active) {
-        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: window closed");
-        s_launch_pending = false;
-        prv_reset_streak();
+
+        ++motion.valid_minutes;
+        vmc_sum += vmc;
+        steps_sum += steps;
+        if (vmc > motion.peak_vmc) motion.peak_vmc = vmc;
+        if (vmc < MOTION_QUIET_VMC_MAX && steps == 0) {
+            ++motion.quiet_minutes;
+        }
+        if ((uint32_t)record_end >= motion.latest_timestamp) {
+            motion.latest_timestamp = (uint32_t)record_end;
+            motion.latest_vmc = vmc;
+            motion.latest_steps =
+                steps > 65535u ? 65535u : (uint16_t)steps;
+        }
+    }
+
+    if (motion.valid_minutes != 0) {
+        motion.mean_vmc = vmc_sum / motion.valid_minutes;
+    }
+    motion.window_steps =
+        steps_sum > 65535u ? 65535u : (uint16_t)steps_sum;
+    return motion;
+}
+
+// Detector integration ------------------------------------------------------
+
+static void prv_analyze_heart_rate(int16_t heart_rate_bpm) {
+    if (!s_health_subscribed || heart_rate_bpm <= 0) return;
+
+    // Only an actual HealthEventHeartRateUpdate reaches here. There is no
+    // fallback timer that can replay a stale filtered value as new evidence.
+    time_t now = time(NULL);
+    NapDetectorSample sample;
+    sample.timestamp = (uint32_t)now;
+    sample.heart_rate_bpm = heart_rate_bpm;
+    sample.motion = prv_get_motion_summary(now);
+
+    s_last_hr_bpm = heart_rate_bpm;
+    s_last_hr_time = now;
+    NapDetectorResult result = nap_detector_process(&s_detector, &sample);
+    if (!result.sample_accepted) return;
+    s_last_accepted_hr_time = now;
+    s_last_motion_fresh = result.motion_fresh;
+    prv_save_baseline_if_changed();
+
+    if (!s_window_active && s_detector.phase != NAP_DETECTOR_ARMED) {
+        // The lead-in may seed the slow awake baseline, but it must never carry
+        // an episode/evidence streak across the actual guard boundary. ARMED
+        // calibration history is retained; opening the window resets it once.
+        prv_reset_episode();
+    } else if (result.action == NAP_DETECTOR_ACTION_NUDGE) {
+        if (!prv_fire_nudge()) prv_reset_episode();
+    } else if (result.action == NAP_DETECTOR_ACTION_ALARM) {
+        if (!prv_fire_alarm()) prv_reset_episode();
+    }
+
+    int rmssd = prv_current_rmssd();
+    prv_write_analysis_telemetry(
+        result.smoothed_hr_bpm, &sample.motion, rmssd, now,
+        result.action != NAP_DETECTOR_ACTION_NONE);
+    prv_set_sensor_periods();
+
+    APP_LOG(APP_LOG_LEVEL_DEBUG,
+            "NapBuster: hr=%d smooth=%u base=%u vmc=%u phase=%d ev=%lus",
+            (int)heart_rate_bpm, (unsigned)result.smoothed_hr_bpm,
+            (unsigned)nap_detector_baseline_bpm(&s_detector),
+            (unsigned)sample.motion.latest_vmc, (int)s_detector.phase,
+            (unsigned long)s_detector.evidence_seconds);
+}
+
+static void prv_check_tier2_sleep(void) {
+    HealthActivityMask activity = health_service_peek_current_activities();
+    if ((activity & HealthActivitySleep) ||
+        (activity & HealthActivityRestfulSleep)) {
+        if (!prv_fire_alarm()) {
+            // Policy blocked the action; do not leave a consumed Tier-1 action
+            // silently latched behind the foreground state.
+            prv_reset_episode();
+            prv_set_sensor_periods();
+        }
     }
 }
 
-// ─── Window Boundary Timer ────────────────────────────────────────────────────
+// Window/lifecycle state -----------------------------------------------------
 
-static void prv_window_timer_callback(void *ctx);  // fwd
+static void prv_apply_window_state(void) {
+    bool enabled = prv_get_enabled();
+    bool in_window = enabled && prv_is_in_window();
+    bool boundary_changed = in_window != s_window_active;
 
-static void prv_start_window_timer(void) {
-    if (s_window_timer) return;
-    s_window_timer = app_timer_register(WINDOW_CHECK_MS,
-                                        prv_window_timer_callback, NULL);
+    if (boundary_changed) {
+        s_window_active = in_window;
+        s_launch_pending = false;
+        s_launch_pending_time = 0;
+        prv_reset_episode();
+        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: guard window %s",
+                in_window ? "opened" : "closed");
+    }
+
+    bool in_lead = enabled && s_hr_capable && !in_window &&
+                   prv_is_in_lead_period();
+    bool want_health = in_window || in_lead;
+    if (want_health) prv_subscribe_health();
+
+    prv_set_sensor_periods();
+    if (!want_health) prv_unsubscribe_health();
+    prv_write_status();
+
+    if (in_window && boundary_changed && s_health_subscribed) {
+        prv_check_tier2_sleep();
+    }
 }
 
-static void prv_window_timer_callback(void *ctx) {
-    s_window_timer = NULL;
+static void prv_minute_tick(struct tm *tick_time, TimeUnits units_changed) {
+    (void)tick_time;
+    (void)units_changed;
 
-    // Self-heal HR capability: if the probe failed at worker start (e.g. right
-    // after a reboot before the activity service warmed up), retry each minute.
+    // This also ages out stale foreground ALARMING state even after a launch
+    // was acknowledged, and recovers when an acknowledgement message is lost.
+    prv_reconcile_foreground_state();
+    prv_expire_pending_launches();
+    time_t now = time(NULL);
+    if (s_detector.phase != NAP_DETECTOR_ARMED &&
+        (s_last_accepted_hr_time <= 0 || now < s_last_accepted_hr_time ||
+         (now - s_last_accepted_hr_time) >
+             NAP_DETECTOR_MAX_GAP_SECONDS)) {
+        // With no callbacks the portable core cannot observe the gap itself.
+        // Bound candidate lifetime here so fast HR/HRV requests cannot stick.
+        prv_reset_episode();
+        APP_LOG(APP_LOG_LEVEL_WARNING,
+                "NapBuster: stale candidate reset after HR event gap");
+    }
     if (!s_hr_capable && prv_probe_hr_capable()) {
         s_hr_capable = true;
-        prv_load_hr_state();
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker: HR became available — Tier 1 enabled");
+        APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: heart rate became available");
     }
-
     prv_apply_window_state();
-    prv_start_window_timer();  // re-arm
 }
 
-static void prv_stop_window_timer(void) {
-    if (s_window_timer) {
-        app_timer_cancel(s_window_timer);
-        s_window_timer = NULL;
-    }
-}
+static void prv_health_event_handler(HealthEventType event, void *context) {
+    (void)context;
 
-// ─── HealthService Callback (Tier 1 fast path + Tier 2 fallback) ─────────────
-
-static void prv_health_event_handler(HealthEventType event, void *ctx) {
-    // ── HealthEventSignificantUpdate — re-check sleep state ──────────────────
-    if (event == HealthEventSignificantUpdate) {
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster: HealthEventSignificantUpdate — re-checking sleep");
-        HealthActivityMask activities = health_service_peek_current_activities();
-        bool is_sleeping = (activities & HealthActivitySleep) ||
-                           (activities & HealthActivityRestfulSleep);
-        if (is_sleeping) {
-            prv_try_launch_foreground();
-        } else {
-            s_launch_pending = false;
+    if (event == HealthEventHeartRateUpdate) {
+        // The event can represent either raw or filtered HR changing. Filtered
+        // BPM is itself an older moving average, so stamping it with `now`
+        // would replay lagged data as fresh evidence. Analyze raw BPM only;
+        // median smoothing and physiological gating live in the core.
+        HealthValue current =
+            health_service_peek_current_value(HealthMetricHeartRateRawBPM);
+        if (current > 0) {
+            if (!s_hr_capable) {
+                s_hr_capable = true;
+                prv_apply_window_state();
+            }
+            prv_analyze_heart_rate((int16_t)current);
         }
-        return;
-    }
-
-    if (event == HealthEventHeartRateUpdate && s_hr_capable) {
-        // ── Tier 1 fast path — new HR reading available ───────────────────────
-        // peek self-limits to samples <15 min old; a 0 just skips the cycle.
-        HealthValue peeked =
-            health_service_peek_current_value(HealthMetricHeartRateBPM);
-        int16_t hr_val = (peeked > 0) ? (int16_t)peeked : 0;
-        s_last_hr_event_time = time(NULL);
-        APP_LOG(APP_LOG_LEVEL_DEBUG,
-            "NapBuster Tier1: HR event — BPM=%d", (int)hr_val);
-        prv_run_tier1_analysis(hr_val);
         return;
     }
 
     if (event == HealthEventHRVUpdate) {
-        // ── HRV fast path — one raw PPI reading per event ─────────────────────
-        // Events only arrive while we hold an HRV sample period; the reading is
-        // fresh by construction. Ingest (artifact-gated) and return — the
-        // spread is evaluated on the next analysis cycle alongside HR + VMC.
-        uint16_t ppi = health_service_peek_hrv_ppi_ms();
-        if (ppi > 0) prv_ingest_ppi(ppi);
+        uint16_t ppi_ms = health_service_peek_hrv_ppi_ms();
+        if (ppi_ms > 0) prv_ingest_ppi(ppi_ms);
         return;
     }
 
-    // ── Tier 2 — sleep confirmation via OS activity classification ───────────
-    HealthActivityMask activities = health_service_peek_current_activities();
-    bool is_sleeping = (activities & HealthActivitySleep) ||
-                       (activities & HealthActivityRestfulSleep);
-
-    if (is_sleeping) {
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            s_hr_capable ? "NapBuster Tier2 (fallback): sleep confirmed"
-                         : "NapBuster Tier2: sleep confirmed");
-        prv_try_launch_foreground();
-    } else {
-        // User is awake — reset so a future doze-off can re-trigger
-        s_launch_pending = false;
-    }
+    // Pebble's classified sleep is a slower, all-platform fallback.
+    if (s_window_active) prv_check_tier2_sleep();
 }
 
-// ─── App Message Handler ─────────────────────────────────────────────────────
-
-static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
+static void prv_app_message_handler(uint16_t type, AppWorkerMessage *message) {
+    (void)message;
     switch (type) {
         case APP_MSG_DISMISS:
         case APP_MSG_SNOOZE_10:
         case APP_MSG_SNOOZE_30:
             s_launch_pending = false;
-            prv_reset_streak();
-            APP_LOG(APP_LOG_LEVEL_INFO,
-                "NapBuster worker: alarm %s acknowledged",
-                type == APP_MSG_DISMISS ? "dismiss" : "snooze");
+            s_launch_pending_time = 0;
+            s_observed_alarming = false;
+            persist_delete(PERSIST_KEY_NUDGE_PENDING);
+            prv_reset_episode();
+            prv_set_sensor_periods();
             break;
 
         case APP_MSG_SETTINGS_CHANGED:
             s_launch_pending = false;
-            prv_reset_streak();
+            s_launch_pending_time = 0;
+            nap_detector_set_sensitivity(&s_detector,
+                                         prv_get_sensitivity());
+            prv_reset_episode();
             prv_apply_window_state();
-            APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker: settings reloaded");
             break;
 
         default:
@@ -1165,54 +939,34 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *msg) {
     }
 }
 
-// ─── Worker Lifecycle ─────────────────────────────────────────────────────────
-
 static void worker_init(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v9: starting");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster detector worker starting");
+    prv_migrate_detector_state();
+    prv_load_detector_state();
+    prv_clear_ppi();
+    prv_write_rmssd(-1);
+    persist_write_int(PERSIST_KEY_TRIGGER_STREAK, 0);
+    persist_write_int(PERSIST_KEY_DEBUG_PHASE, NAP_DETECTOR_ARMED);
 
     app_worker_message_subscribe(prv_app_message_handler);
-
-    // Runtime HR capability detection (self-heals in the window timer if the
-    // health service isn't ready yet). False on basalt/chalk → Tier 2 only.
     s_hr_capable = prv_probe_hr_capable();
-    APP_LOG(APP_LOG_LEVEL_INFO,
-        "NapBuster worker v9: HR capable=%d", (int)s_hr_capable);
-
-    if (s_hr_capable) {
-        prv_load_hr_state();
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v9: loaded HR state count=%d streak=%d baseline=%d",
-            (int)s_hr_buf_count, (int)s_trigger_streak, (int)s_hr_awake_baseline);
-    }
-
-    // Reconcile subscriptions / boost / timers with the current window state.
-    // s_window_active starts false, so starting inside the window runs the
-    // "window opened" path including the immediate Tier-2 sleep check.
+    prv_expire_pending_launches();
     prv_apply_window_state();
-
-    // Always run the 60 s boundary timer
-    prv_start_window_timer();
+    // TickTimerService is aligned to real minute boundaries and is the
+    // low-power worker primitive intended for ongoing schedule checks.
+    tick_timer_service_subscribe(MINUTE_UNIT, prv_minute_tick);
 }
 
 static void worker_deinit(void) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster worker v9: stopping");
-
-    prv_set_hr_boost(false);   // never leave a boosted sample period behind
-    prv_set_hrv_boost(false);  // ditto for the HRV period
-    prv_stop_sample_timer();
-    prv_stop_window_timer();
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster detector worker stopping");
+    tick_timer_service_unsubscribe();
+    prv_set_hr_period(0);
+    prv_set_hrv_period(0);
     prv_unsubscribe_health();
+    prv_save_baseline_if_changed();
+    persist_write_int(PERSIST_KEY_WORKER_STATUS, 0);
     app_worker_message_unsubscribe();
-
-    if (s_hr_capable) {
-        prv_save_hr_state();
-        APP_LOG(APP_LOG_LEVEL_INFO,
-            "NapBuster worker v9: saved HR state count=%d streak=%d",
-            (int)s_hr_buf_count, (int)s_trigger_streak);
-    }
 }
-
-// ─── Entry Point ─────────────────────────────────────────────────────────────
 
 int main(void) {
     worker_init();

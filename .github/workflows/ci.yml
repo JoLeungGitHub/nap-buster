@@ -1,0 +1,57 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detector-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run portable detector tests
+        run: make -C tests test
+
+  pebble-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pebble-tool
+        run: pip install pebble-tool==5.0.40
+
+      - name: Cache Pebble SDK 4.33.1
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pebble-sdk
+          key: pebble-sdk-${{ runner.os }}-4.33.1-v1
+
+      - name: Install Pebble SDK 4.33.1
+        run: |
+          if pebble sdk list 2>/dev/null | grep -q "4.33.1.*(active)"; then
+            pebble sdk list | head -3
+          else
+            pebble sdk install 4.33.1
+          fi
+
+      - name: Build all target platforms
+        run: pebble build
+
+      - name: Assert app bundle
+        run: test -f "$(ls build/*.pbw | head -1)"

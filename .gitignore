@@ -4,3 +4,10 @@ build/
 
 # Local wrangler cache (account info) — deploys run in CI
 .wrangler/
+
+# Local assistant configuration
+.claude/
+
+# Portable detector test binary
+tests/test_nap_detector
+tests/test_nap_detector.exe

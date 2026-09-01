@@ -77,11 +77,28 @@ static void cancel_existing_wakeup(void) {
     }
 }
 
+/** Finish a snooze wakeup without creating an out-of-hours alarm.
+ *
+ * A scheduled wakeup can arrive after the guard was disabled, its day was
+ * deselected, or the configured window ended.  In those cases snooze is
+ * cleared and the worker is reconciled, but the user is not disturbed. */
+static void handle_snooze_expiry(void) {
+    persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
+    persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
+
+    if (settings_get_enabled() && is_in_no_nap_window()) {
+        start_alarm();
+        return;
+    }
+
+    AppWorkerMessage msg = { .data0 = APP_MSG_SETTINGS_CHANGED };
+    app_worker_send_message(APP_MSG_SETTINGS_CHANGED, &msg);
+    update_home_screen();
+}
+
 static void wakeup_handler(WakeupId id, int32_t cookie) {
     if (cookie == WAKEUP_REASON_SNOOZE) {
-        persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
-        persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
-        start_alarm();
+        handle_snooze_expiry();
     }
 }
 
@@ -152,8 +169,8 @@ static void stop_alarm(void) {
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
     cancel_existing_wakeup();
 
-    // Tell the worker the alarm was acknowledged: it resets its detection
-    // streak, and the persisted timestamp gives it a short re-fire cooldown
+    // Tell the worker the alarm was acknowledged: it resets candidate
+    // evidence, and the persisted timestamp gives it a short re-fire cooldown
     // (Tier 2's sleep classification stays stale for a while after waking).
     persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
     AppWorkerMessage msg = { .data0 = APP_MSG_DISMISS };
@@ -164,7 +181,7 @@ static void stop_alarm(void) {
 
 /** Cancel an active snooze and resume guarding immediately (SELECT while
  *  SNOOZED). Tells the worker to reload settings, which clears its launch
- *  guard and re-evaluates the window/streak fresh — same as a normal
+ *  guard and re-evaluates the window/candidate fresh — same as a normal
  *  settings-change reconcile. */
 static void cancel_snooze(void) {
     if (!persist_exists(PERSIST_KEY_SNOOZE_UNTIL)) return;
@@ -246,7 +263,7 @@ static void update_home_screen(void) {
     bool enabled     = settings_get_enabled();
     int  start_hour  = settings_get_start_hour();
     int  end_hour    = settings_get_end_hour();
-    bool in_window   = is_in_no_nap_window();  // checks days + hours + enabled
+    bool in_window   = is_in_no_nap_window();  // checks active days + hours
 
     // ── Check snooze ──
     bool snoozed = false;
@@ -376,24 +393,40 @@ static void update_home_screen(void) {
     layer_mark_dirty(s_state_bar);
 
     // ── Debug telemetry display (GUARDING state only) ──
-    // 64 bytes covers the compiler-computed worst case of the HRV format
     static char debug_buf[64];
     if (state == HOME_STATE_GUARDING) {
         int16_t dbg_hr  = persist_exists(PERSIST_KEY_DEBUG_HR)
                           ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_HR) : 0;
-        int16_t dbg_avg = persist_exists(PERSIST_KEY_DEBUG_AVG)
+        int16_t baseline = persist_exists(PERSIST_KEY_DEBUG_AVG)
                           ? (int16_t)persist_read_int(PERSIST_KEY_DEBUG_AVG) : 0;
-        int32_t dbg_acc = persist_exists(PERSIST_KEY_DEBUG_ACCEL)
+        int32_t vmc = persist_exists(PERSIST_KEY_DEBUG_ACCEL)
                           ? persist_read_int(PERSIST_KEY_DEBUG_ACCEL) : 0;
-        uint8_t streak  = persist_exists(PERSIST_KEY_TRIGGER_STREAK)
+        uint8_t evidence_mins = persist_exists(PERSIST_KEY_TRIGGER_STREAK)
                           ? (uint8_t)persist_read_int(PERSIST_KEY_TRIGGER_STREAK) : 0;
         int32_t last_ts = persist_exists(PERSIST_KEY_DEBUG_LAST_TS)
                           ? persist_read_int(PERSIST_KEY_DEBUG_LAST_TS) : 0;
-        int32_t dbg_hrv = persist_exists(PERSIST_KEY_DEBUG_HRV)
+        int32_t rmssd = persist_exists(PERSIST_KEY_DEBUG_HRV)
                           ? persist_read_int(PERSIST_KEY_DEBUG_HRV) : -1;
-        int16_t hrv_base = persist_exists(PERSIST_KEY_HRV_BASELINE)
-                          ? (int16_t)persist_read_int(PERSIST_KEY_HRV_BASELINE) : 0;
-        if (dbg_hr > 0) {
+        int phase = persist_exists(PERSIST_KEY_DEBUG_PHASE)
+                          ? persist_read_int(PERSIST_KEY_DEBUG_PHASE)
+                          : DETECTOR_PHASE_ARMED;
+        uint8_t status = persist_exists(PERSIST_KEY_WORKER_STATUS)
+                          ? (uint8_t)persist_read_int(PERSIST_KEY_WORKER_STATUS)
+                          : 0;
+        char phase_char = phase == DETECTOR_PHASE_NUDGED ? 'N'
+                          : phase == DETECTOR_PHASE_CANDIDATE ? 'C' : 'A';
+
+        if (!app_worker_is_running() || !(status & WORKER_STATUS_RUNNING)) {
+            snprintf(debug_buf, sizeof(debug_buf), "Worker starting...");
+        } else if (!(status & WORKER_STATUS_HEALTH_ACTIVE)) {
+            snprintf(debug_buf, sizeof(debug_buf), "Health unavailable");
+        } else if (!(status & WORKER_STATUS_HR_CAPABLE)) {
+            snprintf(debug_buf, sizeof(debug_buf), "OS sleep fallback");
+        } else if (!(status & WORKER_STATUS_HR_ACTIVE)) {
+            snprintf(debug_buf, sizeof(debug_buf), "HR sensor retrying");
+        } else if (!(status & WORKER_STATUS_BASELINE_READY) || baseline <= 0) {
+            snprintf(debug_buf, sizeof(debug_buf), "Calibrating HR...");
+        } else if (dbg_hr > 0) {
             // Age of the last completed analysis — the quickest way to see on
             // the watch whether detection is actually running.
             int age_min = -1;
@@ -401,24 +434,23 @@ static void update_home_screen(void) {
                 time_t now = time(NULL);
                 if (now >= (time_t)last_ts) age_min = (int)((now - last_ts) / 60);
             }
-            char age_str[8] = "";
+            char age_str[9] = "";
             if (age_min >= 0 && age_min < 100) {
-                snprintf(age_str, sizeof(age_str), " %dm", age_min);
+                snprintf(age_str, sizeof(age_str), " a:%dm", age_min);
             }
-            if (dbg_hrv >= 0) {
-                // HRV mode: current/baseline pairs — "HR:64/71 h:42/28 v:38 x2 0m"
+            if (rmssd >= 0) {
                 snprintf(debug_buf, sizeof(debug_buf),
-                         "HR:%d/%d h:%ld/%d v:%ld x%d%s",
-                         (int)dbg_hr, (int)dbg_avg, (long)dbg_hrv, (int)hrv_base,
-                         (long)dbg_acc, (int)streak, age_str);
+                         "HR:%d/%d r:%ld v:%ld %c e:%dm%s",
+                         (int)dbg_hr, (int)baseline, (long)rmssd, (long)vmc,
+                         phase_char, (int)evidence_mins, age_str);
             } else {
                 snprintf(debug_buf, sizeof(debug_buf),
-                         "HR:%d base:%d vmc:%ld x%d%s",
-                         (int)dbg_hr, (int)dbg_avg, (long)dbg_acc, (int)streak,
-                         age_str);
+                         "HR:%d/%d v:%ld %c e:%dm%s",
+                         (int)dbg_hr, (int)baseline, (long)vmc, phase_char,
+                         (int)evidence_mins, age_str);
             }
         } else {
-            snprintf(debug_buf, sizeof(debug_buf), "HR: warming up...");
+            snprintf(debug_buf, sizeof(debug_buf), "Waiting for HR...");
         }
         text_layer_set_text(s_debug_label, debug_buf);
     } else {
@@ -604,8 +636,18 @@ static void main_window_unload(Window *window) {
 // ─── App lifecycle ────────────────────────────────────────────────────────────
 
 static void app_init(void) {
+    AppLaunchReason initial_reason = launch_reason();
+    bool worker_launch_is_nudge =
+        initial_reason == APP_LAUNCH_WORKER &&
+        persist_exists(PERSIST_KEY_NUDGE_PENDING) &&
+        persist_read_int(PERSIST_KEY_NUDGE_PENDING);
+
     wakeup_service_subscribe(wakeup_handler);
-    app_worker_message_subscribe(worker_message_handler);
+
+    // Do not subscribe to worker messages until the window and launch reason
+    // have been handled.  A nudge message arriving earlier could clear the
+    // persisted launch kind before APP_LAUNCH_WORKER reads it (turning a
+    // nudge into a full alarm), while an alarm message could touch null UI.
 
     // No minute tick needed — face doesn't change on time, only on state changes
     // tick_timer_service_subscribe removed to save battery
@@ -622,41 +664,38 @@ static void app_init(void) {
     window_set_window_handlers(s_win, wh);
     window_stack_push(s_win, true);
 
-    // Ensure background worker is running
-    AppWorkerResult res = app_worker_launch();
-    if (res != APP_WORKER_RESULT_SUCCESS &&
-        res != APP_WORKER_RESULT_ALREADY_RUNNING) {
-        APP_LOG(APP_LOG_LEVEL_WARNING,
-            "NapBuster: worker launch failed (result=%d)", res);
-    }
-
     // Wakeup launch → snooze expired
-    if (launch_reason() == APP_LAUNCH_WAKEUP) {
+    if (initial_reason == APP_LAUNCH_WAKEUP) {
         WakeupId wid;
         int32_t  cookie;
         if (wakeup_get_launch_event(&wid, &cookie) &&
             cookie == WAKEUP_REASON_SNOOZE) {
-            persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
-            persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
-            start_alarm();
-            return;
+            handle_snooze_expiry();
         }
-    }
-
-    // Worker launch → sleep detected OR nudge
-    if (launch_reason() == APP_LAUNCH_WORKER) {
-        if (persist_exists(PERSIST_KEY_NUDGE_PENDING) &&
-                persist_read_int(PERSIST_KEY_NUDGE_PENDING)) {
+    } else if (initial_reason == APP_LAUNCH_WORKER) {
+        // Snapshotting the persisted launch kind before subscribing prevents
+        // the direct worker message from turning this nudge into an alarm.
+        if (worker_launch_is_nudge) {
             // Nudge mode: double pulse, show home screen, no alarm
             persist_delete(PERSIST_KEY_NUDGE_PENDING);
             vibes_double_pulse();
         } else {
             start_alarm();
         }
-        return;
     }
 
-    // Normal launch → draw home screen (appear handler fires after load)
+    // The UI and launch intent are now ready, so direct messages are safe.
+    app_worker_message_subscribe(worker_message_handler);
+
+    // Ensure the background worker is running only after subscribing. This
+    // closes the small normal-launch window in which a fresh detector action
+    // could otherwise be sent before the foreground was listening.
+    AppWorkerResult res = app_worker_launch();
+    if (res != APP_WORKER_RESULT_SUCCESS &&
+        res != APP_WORKER_RESULT_ALREADY_RUNNING) {
+        APP_LOG(APP_LOG_LEVEL_WARNING,
+            "NapBuster: worker launch failed (result=%d)", res);
+    }
 }
 
 static void app_deinit(void) {

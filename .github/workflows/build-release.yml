@@ -32,25 +32,27 @@ jobs:
           python-version: '3.11'
 
       - name: Install pebble-tool
-        run: pip install pebble-tool
+        run: pip install pebble-tool==5.0.40
 
       # The SDK download (ARM toolchain + QEMU) is large — cache it between
-      # runs. Keyed coarsely on purpose: `pebble sdk install latest` below
-      # re-runs only when the cache is cold.
+      # runs. Keep releases reproducible on the SDK version used in CI.
       - name: Cache Pebble SDK
         uses: actions/cache@v4
         with:
           path: ~/.local/share/pebble-sdk
-          key: pebble-sdk-${{ runner.os }}-v1
+          key: pebble-sdk-${{ runner.os }}-4.33.1-v1
 
       - name: Install Pebble SDK (skip if restored from cache)
         run: |
-          if pebble sdk list 2>/dev/null | grep -q "(active)"; then
+          if pebble sdk list 2>/dev/null | grep -q "4.33.1.*(active)"; then
             echo "Pebble SDK restored from cache:"
             pebble sdk list | head -3
           else
-            pebble sdk install latest
+            pebble sdk install 4.33.1
           fi
+
+      - name: Build and run portable detector tests
+        run: make -C tests test
 
       - name: Build
         run: pebble build
