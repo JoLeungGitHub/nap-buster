@@ -2,9 +2,9 @@
 
 > A Pebble watch app that catches you dozing during the day and buzzes you awake — so nights stay for sleeping.
 
-NapBuster runs entirely on the watch: no cloud, no phone app, no account. A background worker guards your configured no-nap hours with two-tier detection. Heart rate is the primary signal — as you drift off, your smoothed HR sinks below an anchored awake baseline while motion (VMC) gates out false alarms. After ~4–5 minutes of sustained evidence it gives a quiet nudge; still sinking at ~10 minutes and the full repeating alarm fires, with 10/30-minute snooze. On watches without a heart-rate sensor, the OS's own sleep classification is a slower fallback trigger.
+NapBuster runs entirely on the watch: no cloud, no phone app, no account. A background worker guards your configured no-nap hours with two-tier detection. Heart rate is the primary signal — as you drift off, your median-filtered HR sinks below a baseline calibrated from quiet readings, while motion (movement intensity and step counts) gates out false alarms. After ~4–5 minutes of sustained evidence it gives a quiet nudge; still sinking at ~10 minutes and the full repeating alarm fires, with 10/30-minute snooze. On watches without a heart-rate sensor, the OS's own sleep classification is a slower fallback trigger.
 
-Supported watches: Pebble Time 2 and Pebble 2 HR (heart-rate detection + fallback), Pebble Time / Time Steel and Pebble Time Round (fallback tier only). Requires Pebble Health enabled in the rePebble mobile app. Free and open source under the MIT license.
+Supported watches: Pebble Time 2 and Pebble 2 HR (heart-rate detection + fallback), Pebble Time / Time Steel and Pebble Time Round (fallback tier only). Requires Pebble Health enabled in the rePebble mobile app. The detection core is portable C covered by host-run scenario tests that gate every release. Free and open source under the MIT license.
 
 ## Links
 

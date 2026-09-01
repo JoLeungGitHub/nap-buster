@@ -51,7 +51,7 @@
       "description": "A Pebble watch app that catches you dozing during the day and buzzes you awake — so nights stay for sleeping. Two-tier nap detection from heart rate and motion, entirely on the watch.",
       "operatingSystem": "Pebble",
       "applicationCategory": "HealthApplication",
-      "softwareVersion": "2.4.0",
+      "softwareVersion": "3.0.0",
       "image": "https://napbuster.joleu.ng/social/og.png",
       "installUrl": "https://apps.repebble.com/52a046fc07234439822d30e5",
       "downloadUrl": "https://github.com/JoLeungGitHub/nap-buster",
@@ -239,6 +239,7 @@
     color: var(--muted); margin-top: 34px;
   }
   .debugline span { color: var(--green); }
+  .debugline small { display:block; margin-top:6px; font-size:.72rem; opacity:.75; }
 
   /* ── features ─────────────────────────────────────────── */
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
@@ -362,7 +363,7 @@
      spots a nap forming in minutes, and buzzes it away — entirely on your Pebble.</p>
 
   <div class="badges">
-    <span class="badge"><b>v2.4.0</b></span>
+    <span class="badge"><b>v3.0.0</b></span>
     <span class="badge">MIT license</span>
     <span class="badge">Pebble Time 2 · Pebble 2 · Time · Round</span>
     <span class="badge">no phone app needed</span>
@@ -386,8 +387,8 @@
   <h2 data-reveal>How it works</h2>
   <p class="lead" data-reveal style="--rd:1">A background worker guards your configured no-nap hours with
      two-tier detection. Heart rate is the primary signal — as you drift off,
-     your HR sinks below your awake baseline. Motion (VMC) is the gate that
-     rules out false alarms while you're up and about.</p>
+     your HR sinks below your awake baseline. Motion — movement intensity and step counts alike — is
+     the gate that rules out false alarms while you are up and about.</p>
 
   <div class="timeline" aria-label="Detection timeline from nap onset to alarm" data-reveal>
     <div class="tl-bar">
@@ -404,9 +405,10 @@
     <div class="step green" data-reveal>
       <div class="n mono">TIER 1 · STEP 1</div>
       <h3>WATCH THE HEART</h3>
-      <p>While guarding, NapBuster samples your heart rate every 60 seconds.
-         When the smoothed value drops 8–20% (your choice) below your anchored
-         awake baseline <em>and</em> you're very still, a streak starts counting.</p>
+      <p>Every real heart-rate reading is judged the moment it arrives. When the
+         median-filtered value sits 8–16% (your choice) below your calibrated
+         awake baseline <em>and</em> motion agrees you are genuinely still, a
+         candidate episode opens and the clock starts.</p>
     </div>
     <div class="step amber" data-reveal style="--rd:1">
       <div class="n mono">TIER 1 · STEP 2</div>
@@ -426,9 +428,10 @@
   <div class="how-notes">
     <div class="note" data-reveal>
       <h3>Anchored awake baseline</h3>
-      <p>Your reference HR never chases you into a nap: it moves up freely
-         (unless you're exercising) but only moves down when movement proves
-         you're awake. A rolling average can't do that.</p>
+      <p>Your reference HR calibrates only from clustered readings taken while you
+         are genuinely still — and a falling heart rate never forms a stable
+         cluster, so it cannot quietly calibrate itself to a doze. It then holds
+         frozen for the whole of an episode.</p>
     </div>
     <div class="note" data-reveal style="--rd:1">
       <h3>Tier 2 safety net</h3>
@@ -438,10 +441,17 @@
     </div>
     <div class="note" data-reveal style="--rd:2">
       <h3>Honest battery math</h3>
-      <p>Outside your no-nap window, NapBuster piggybacks on samples the OS
-         takes anyway — zero extra cost. Inside the window it requests
-         60-second HR sampling; that's the one real spend, and it stops the
-         moment the window closes. (Tunable via <code>HR_BOOST_PERIOD_SECS</code>.)</p>
+      <p>Sensors idle outside your no-nap window. Inside it NapBuster rides the
+         readings the watch already takes, and only probes faster once a
+         candidate episode opens — to confirm or clear it — then backs off
+         again. Nothing ever leaves the watch.</p>
+    </div>
+    <div class="note" data-reveal style="--rd:3">
+      <h3>Tested, not just written</h3>
+      <p>The detection core is plain C with no watch dependencies, so it runs
+         on a laptop against 13 scenario tests — exact alert boundaries, clock
+         jumps, missing data, calibration. CI runs them on every change, and a
+         release cannot be built unless they pass.</p>
     </div>
   </div>
 </section>
@@ -466,19 +476,20 @@
       <figcaption><b>ACTIVE DAYS</b> — weekdays only? sure</figcaption>
     </figure>
   </div>
-  <div class="debugline" data-reveal>live telemetry while guarding:&nbsp; <span>HR:68 base:74 vmc:42 x1 0m</span></div>
+  <div class="debugline" data-reveal>live telemetry while guarding:&nbsp; <span>HR:64/72 v:38 C e:3m a:0m</span><br>
+    <small>heart rate / baseline &middot; motion &middot; phase &middot; evidence &middot; age of last analysis</small></div>
 </section>
 
 <section class="wrap" id="features">
   <h2 data-reveal>Features</h2>
   <div class="grid">
-    <div class="feat" data-reveal><h3>🔬 Minute-level detection</h3><p>Owned 60 s HR cadence inside the guard window — not the OS's lazy 10-minute default.</p></div>
+    <div class="feat" data-reveal><h3>🔬 Event-driven detection</h3><p>Every genuine heart-rate reading is judged on arrival — no stale value is ever replayed as fresh evidence.</p></div>
     <div class="feat" data-reveal style="--rd:1"><h3>🔔 Two-stage wake</h3><p>Gentle nudge first; the full alarm only if you keep sinking. Both time-based, not sample-count roulette.</p></div>
     <div class="feat" data-reveal style="--rd:2"><h3>💤 Snooze that survives</h3><p>10 or 30 minutes via the Wakeup API — works even if the app closes.</p></div>
     <div class="feat" data-reveal style="--rd:3"><h3>📅 Per-day schedule</h3><p>Guard weekdays, weekends, or any custom set of days and hours.</p></div>
     <div class="feat" data-reveal><h3>💪 Three vibe strengths</h3><p>Gentle, Medium, Strong — pulse-density patterns, test-buzzed as you pick.</p></div>
     <div class="feat" data-reveal style="--rd:1"><h3>🎛️ Tunable sensitivity</h3><p>Sensitive / Balanced / Conservative HR-drop thresholds to match your physiology.</p></div>
-    <div class="feat" data-reveal style="--rd:2"><h3>📊 Live telemetry</h3><p>HR, baseline, motion, streak and analysis age right on the watch face — see it working.</p></div>
+    <div class="feat" data-reveal style="--rd:2"><h3>📊 Live telemetry</h3><p>HR, baseline, motion, phase and evidence timing right on the watch face — see it working.</p></div>
     <div class="feat" data-reveal style="--rd:3"><h3>🛡️ Fallback tier</h3><p>OS sleep classification backs up the HR engine on all supported watches.</p></div>
   </div>
 </section>
