@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v3.0.0** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v3.0.1** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When NapBuster sees sustained signs that you may be dozing during your configured no-nap hours, it gives you a gentle nudge. If stronger evidence continues and you do not appear to respond, it escalates to a repeating alarm.
 
@@ -23,8 +23,8 @@ Timestamped HR event + newest five completed motion minutes
           ▲                 │                 │
           └── movement / HR recovery ────────┘
                             │
-                 4 min valid evidence: nudge
-                10 min without response: alarm
+                 2 min valid evidence: nudge
+                 5 min full evidence: alarm
 ```
 
 The background worker has two detection tiers:
@@ -38,7 +38,7 @@ The background worker has two detection tiers:
 
 **CANDIDATE** begins when fresh motion data says the wrist has been quiet and smoothed HR is falling below the awake baseline. Evidence advances only between accepted positive samples; ambiguous or negative readings add no time and decay or expire the episode. Duplicate/burst HR events, stale motion, implausible HR, long sampling gaps, steps, exercise, or clear HR recovery cannot turn elapsed wall-clock time into evidence.
 
-**NUDGED** begins after four minutes of valid positive evidence. NapBuster gives a double pulse and looks for a response. Clear movement cancels the episode; quiet negative readings decay the accumulated evidence, and sustained HR recovery cancels it. At ten minutes, the foreground app starts the repeating alarm only if HR has reached the level's full-drop threshold. A merely soft plateau ends after its nudge instead of becoming a false full alarm.
+**NUDGED** begins after two minutes of valid positive evidence. NapBuster gives a double pulse and looks for a response. Clear movement cancels the episode; quiet negative readings decay the accumulated evidence, and sustained HR recovery cancels it. At five minutes, the foreground app starts the repeating alarm only if HR is still at the full-drop threshold. A merely soft plateau ends after its nudge instead of becoming a false full alarm.
 
 This explicit state machine prevents two important failure modes in older releases: stale sensor values being counted repeatedly, and a candidate accumulating time while no usable data arrived.
 
@@ -75,7 +75,7 @@ v3.0 uses a new detector-state schema. On first run it clears the old HR baselin
 ## Features
 
 - 🔬 **Early nap detection** — fresh HR, five-minute VMC/step context, and an explicit response-aware state machine
-- 🔔 **Two-stage wake** — gentle nudge after four minutes of valid evidence; full alarm at ten minutes only with a full HR drop
+- 🔔 **Two-stage wake** — gentle nudge after two minutes of valid evidence; full alarm at five minutes only with a continuing full HR drop
 - 🛡️ **Fallback detection** — Pebble Health sleep classification remains a safety net
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed or snoozed
 - 💤 **Snooze** — 10 or 30 minutes via the Wakeup API; an expiry outside the active schedule does not sound an alarm
@@ -267,7 +267,7 @@ Keeping the detector free of Pebble SDK dependencies makes timestamp, gap, basel
 
 ## Detection timing and limits
 
-The **earliest** nudge is after four minutes of accepted positive evidence. The earliest Tier-1 full alarm is at ten minutes when the episode also reaches the selected full HR-drop threshold; a soft-only episode stops after the nudge. Actual time can be longer while the baseline calibrates, when the OS delivers HR less frequently than requested, or when samples are rejected as stale, duplicated, implausible, or separated by a long gap. Pebble Health's fallback classification can be substantially later and may not recognize a short nap.
+The **earliest** nudge is after two minutes of accepted positive evidence. The earliest Tier-1 full alarm is at five minutes when the episode still reaches the selected full HR-drop threshold; a soft-only episode stops after the nudge. Actual time can be longer while the baseline calibrates, when the OS delivers HR less frequently than requested, or when samples are rejected as stale, duplicated, implausible, or separated by a long gap. Pebble Health's fallback classification can be substantially later and may not recognize a short nap.
 
 Wrist actigraphy and optical heart rate cannot prove that someone is awake or asleep. In particular, very quiet wakefulness with an unusually low and falling HR can resemble dozing, while restless dozing, a loose watch, disabled Health access, or missing sensor data can hide it. The nudge-and-response stage reduces false alarms but cannot eliminate them.
 
@@ -279,6 +279,7 @@ NapBuster is a convenience tool, **not a medical or safety device**. Do not rely
 
 | Version | What changed |
 |---|---|
+| **3.0.1** | Tuned response timing from real doze telemetry: valid candidates now nudge after two minutes, and continuing full-drop evidence escalates after five; a soft-only episode cannot trigger the repeating alarm. Sensor cadence is unchanged. Added a regression scenario for a 57 BPM reading against a 68 BPM baseline with zero latest-minute VMC. |
 | **3.0.0** | Replaced the accumulated v2.x trigger logic with a portable ARMED → CANDIDATE → NUDGED detector; fresh event-driven raw HR with 20-second burst rejection and median-of-three smoothing; stable quiet baseline calibration; completed VMC/step summaries; bounded/decaying evidence; 8/12/16% full and 4/6/8% soft HR-drop thresholds, with soft-only episodes limited to a nudge; candidate-only 20-second sensor probing; PPI RMSSD as diagnostic telemetry only; a new persistence schema and host scenario tests. Fixed overnight active-day ownership, snooze expiry outside the guard window, and a foreground launch race that could turn a nudge into a full alarm. |
 | **2.4.1** | Fixed stale foreground alarm state that could prevent later alarms. |
 | **2.4.0–2.3.0** | Experimented with an inter-burst PPI drift signal. v3.0 removes it from detection because it was not a valid substitute for contiguous-beat HRV and was not sufficiently validated. |

@@ -110,28 +110,62 @@ static void test_real_doze_nudges_and_alarms_at_exact_boundaries(void) {
     NapDetectorResult result;
     uint32_t candidate_time = prepare_balanced_candidate(&detector, 2000u);
 
-    result = feed_quiet(&detector, candidate_time + 219u, 70);
-    EXPECT(result.evidence_seconds == 219u);
+    result = feed_quiet(&detector, candidate_time + 99u, 70);
+    EXPECT(result.evidence_seconds == 99u);
     EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
 
-    result = feed_quiet(&detector, candidate_time + 240u, 70);
+    result = feed_quiet(&detector, candidate_time + 120u, 70);
     EXPECT(result.evidence_seconds == NAP_DETECTOR_NUDGE_SECONDS);
     EXPECT(result.action == NAP_DETECTOR_ACTION_NUDGE);
     EXPECT(result.phase == NAP_DETECTOR_NUDGED);
     EXPECT(result.request_fast_sampling);
 
-    result = feed_quiet(&detector, candidate_time + 459u, 70);
-    EXPECT(result.evidence_seconds == 459u);
-    EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
-    result = feed_quiet(&detector, candidate_time + 579u, 70);
-    EXPECT(result.evidence_seconds == 579u);
+    result = feed_quiet(&detector, candidate_time + 279u, 70);
+    EXPECT(result.evidence_seconds == 279u);
     EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
 
-    result = feed_quiet(&detector, candidate_time + 600u, 70);
+    result = feed_quiet(&detector, candidate_time + 300u, 70);
     EXPECT(result.evidence_seconds == NAP_DETECTOR_ALARM_SECONDS);
     EXPECT(result.action == NAP_DETECTOR_ACTION_ALARM);
 
-    result = feed_quiet(&detector, candidate_time + 720u, 70);
+    result = feed_quiet(&detector, candidate_time + 420u, 70);
+    EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
+}
+
+static void test_reported_zero_vmc_full_drop_nudges_before_three_minutes(void) {
+    NapDetector detector;
+    NapDetectorResult result;
+    NapDetectorMotion motion;
+    uint32_t candidate_time;
+
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 68u);
+    (void)feed_quiet(&detector, 3000u, 68);
+    (void)feed_quiet(&detector, 3120u, 68);
+    (void)feed_quiet(&detector, 3240u, 68);
+
+    motion = quiet_motion(3360u);
+    motion.latest_vmc = 0u;
+    (void)feed(&detector, 3360u, 57, motion);
+    motion = quiet_motion(3480u);
+    motion.latest_vmc = 0u;
+    result = feed(&detector, 3480u, 57, motion);
+    candidate_time = 3480u;
+    EXPECT(result.positive);
+    EXPECT(result.hr_full_drop);
+    EXPECT(result.phase == NAP_DETECTOR_CANDIDATE);
+
+    motion = quiet_motion(candidate_time + 120u);
+    motion.latest_vmc = 0u;
+    result = feed(&detector, candidate_time + 120u, 57, motion);
+    EXPECT(result.evidence_seconds == 120u);
+    EXPECT(result.action == NAP_DETECTOR_ACTION_NUDGE);
+    EXPECT(result.phase == NAP_DETECTOR_NUDGED);
+
+    motion = quiet_motion(candidate_time + 180u);
+    motion.latest_vmc = 0u;
+    result = feed(&detector, candidate_time + 180u, 57, motion);
+    EXPECT(result.evidence_seconds == 180u);
     EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
 }
 
@@ -195,6 +229,7 @@ static void test_soft_drop_plateau_sustains_candidate(void) {
     EXPECT(result.hr_soft_drop);
     EXPECT(result.positive);
     EXPECT(result.evidence_seconds == 120u);
+    EXPECT(result.action == NAP_DETECTOR_ACTION_NUDGE);
 }
 
 static void test_soft_only_episode_nudges_but_never_alarms(void) {
@@ -214,13 +249,13 @@ static void test_soft_only_episode_nudges_but_never_alarms(void) {
     EXPECT(result.hr_soft_drop);
     EXPECT(!result.hr_full_drop);
 
-    result = feed_quiet(&detector, candidate_time + 219u, 94);
+    result = feed_quiet(&detector, candidate_time + 99u, 94);
     EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
-    result = feed_quiet(&detector, candidate_time + 240u, 94);
+    result = feed_quiet(&detector, candidate_time + 120u, 94);
     EXPECT(result.action == NAP_DETECTOR_ACTION_NUDGE);
-    (void)feed_quiet(&detector, candidate_time + 459u, 94);
-    (void)feed_quiet(&detector, candidate_time + 579u, 94);
-    result = feed_quiet(&detector, candidate_time + 600u, 94);
+    result = feed_quiet(&detector, candidate_time + 279u, 94);
+    EXPECT(result.phase == NAP_DETECTOR_NUDGED);
+    result = feed_quiet(&detector, candidate_time + 300u, 94);
 
     EXPECT(result.hr_soft_drop);
     EXPECT(!result.hr_full_drop);
@@ -597,6 +632,7 @@ static void test_ambiguous_samples_do_not_bridge(void) {
 int main(void) {
     test_quiet_awake_has_no_action();
     test_real_doze_nudges_and_alarms_at_exact_boundaries();
+    test_reported_zero_vmc_full_drop_nudges_before_three_minutes();
     test_movement_resets_candidate();
     test_isolated_hr_outlier_is_median_filtered();
     test_soft_drop_plateau_sustains_candidate();
