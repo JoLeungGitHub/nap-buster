@@ -440,16 +440,19 @@ NapDetectorResult nap_detector_process(NapDetector *detector,
     }
 
     /* A quiet, awake-range HR is the only steady-state calibration signal.
-     * The boundary is the FULL-drop line, not the soft one: gating on the
-     * soft line is circular, because a baseline a few BPM too high puts
-     * ordinary quiet-awake HR inside the soft band, where it both counts as
-     * doze evidence and blocks the correction that would fix it. Sleep-onset
-     * chasing is still prevented: a falling HR turns positive and leaves
-     * ARMED, and phase_was_armed freezes the baseline for the whole episode,
-     * so only a steady, shallow, non-alerting HR can recalibrate. */
+     * The boundary is the FULL-drop line rather than the soft one, because
+     * gating on the soft line is circular: a baseline a few BPM above the
+     * wearer's true quiet HR puts that HR inside the soft band, where it both
+     * counts as doze evidence and is refused as the calibration input that
+     * would correct it -- a permanent false-alarm latch. Calibration is also
+     * refused on any sample scored positive, which covers the onset sample
+     * that opens an episode (phase_was_armed is still true there), and
+     * phase_was_armed freezes the baseline for the rest of the episode. So
+     * only a steady, shallow, non-alerting HR can recalibrate. */
     if (phase_was_armed && baseline_was_ready && result.motion_fresh &&
         result.quiet && !result.movement && !result.exercise &&
-        result.hr_valid && smoothing_ready && !result.hr_full_drop) {
+        result.hr_valid && smoothing_ready && !result.positive &&
+        !result.hr_full_drop) {
         update_quiet_baseline(detector, smoothed_hr);
         baseline = baseline_bpm(detector);
     }
