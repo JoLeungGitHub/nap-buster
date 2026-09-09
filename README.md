@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v3.0.1** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v3.0.2** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When NapBuster sees sustained signs that you may be dozing during your configured no-nap hours, it gives you a gentle nudge. If stronger evidence continues and you do not appear to respond, it escalates to a repeating alarm.
 
@@ -34,7 +34,7 @@ The background worker has two detection tiers:
 
 ### ARMED → CANDIDATE → NUDGED
 
-**ARMED** is normal monitoring. Three stable readings taken during a fresh, quiet, non-exercise period seed the awake HR baseline. The samples must form a tight cluster, and an isolated outlier is discarded. This works for sedentary users without treating an elevated walking heart rate as their resting baseline. After that, the baseline adapts very slowly only from quiet readings above the soft-drop boundary; it is frozen throughout a possible doze so it cannot follow HR downward and hide the event.
+**ARMED** is normal monitoring. Three stable readings taken during a fresh, quiet, non-exercise period seed the awake HR baseline. The samples must form a tight cluster, and an isolated outlier is discarded. This works for sedentary users without treating an elevated walking heart rate as their resting baseline. After that, the baseline adapts very slowly, and only from quiet readings that are not themselves doze evidence: above the full-drop boundary and not scored positive. It is frozen throughout a possible doze so it cannot follow HR downward and hide the event.
 
 **CANDIDATE** begins when fresh motion data says the wrist has been quiet and smoothed HR is falling below the awake baseline. Evidence advances only between accepted positive samples; ambiguous or negative readings add no time and decay or expire the episode. Duplicate/burst HR events, stale motion, implausible HR, long sampling gaps, steps, exercise, or clear HR recovery cannot turn elapsed wall-clock time into evidence.
 
@@ -279,6 +279,7 @@ NapBuster is a convenience tool, **not a medical or safety device**. Do not rely
 
 | Version | What changed |
 |---|---|
+| **3.0.2** | Fixed a false-alarm latch in baseline calibration. Calibration was gated on the soft-drop boundary, which is circular: a baseline a few BPM above the wearer's true quiet-awake HR puts that HR inside the soft band, where it both counts as doze evidence and is refused as the input that would correct it. The baseline could never come down, so every still moment became a candidate and nudged. Reported from the field as a 68 BPM reading against a latched 73 BPM baseline. Calibration is now refused only above the full-drop boundary and on any sample scored positive (which also covers the episode-onset sample). Timings and sensitivity thresholds are unchanged. |
 | **3.0.1** | Tuned response timing from real doze telemetry: valid candidates now nudge after two minutes, and continuing full-drop evidence escalates after five; a soft-only episode cannot trigger the repeating alarm. Sensor cadence is unchanged. Added a regression scenario for a 57 BPM reading against a 68 BPM baseline with zero latest-minute VMC. |
 | **3.0.0** | Replaced the accumulated v2.x trigger logic with a portable ARMED → CANDIDATE → NUDGED detector; fresh event-driven raw HR with 20-second burst rejection and median-of-three smoothing; stable quiet baseline calibration; completed VMC/step summaries; bounded/decaying evidence; 8/12/16% full and 4/6/8% soft HR-drop thresholds, with soft-only episodes limited to a nudge; candidate-only 20-second sensor probing; PPI RMSSD as diagnostic telemetry only; a new persistence schema and host scenario tests. Fixed overnight active-day ownership, snooze expiry outside the guard window, and a foreground launch race that could turn a nudge into a full alarm. |
 | **2.4.1** | Fixed stale foreground alarm state that could prevent later alarms. |
