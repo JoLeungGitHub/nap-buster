@@ -169,6 +169,48 @@ static void test_reported_zero_vmc_full_drop_nudges_before_three_minutes(void) {
     EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
 }
 
+/* Field report: baseline latched at 73 BPM while quiet-awake HR sat at 68 —
+ * inside the Balanced soft band. Every downward jitter opened a candidate and
+ * nudged, and the calibration gate refused to correct the baseline because the
+ * very reading that proved it wrong also counted as a soft drop. */
+static void test_high_latched_baseline_recovers_downward(void) {
+    NapDetector detector;
+    NapDetectorResult result;
+    uint16_t first_baseline;
+    uint32_t t = 5000u;
+    int i;
+
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 73u);
+
+    (void)feed_quiet(&detector, t, 68);
+    t += 120u;
+    (void)feed_quiet(&detector, t, 68);
+    t += 120u;
+    result = feed_quiet(&detector, t, 68);
+
+    /* Exactly the reported state: soft drop, no full drop, still ARMED. */
+    EXPECT(result.hr_soft_drop);
+    EXPECT(!result.hr_full_drop);
+    EXPECT(result.phase == NAP_DETECTOR_ARMED);
+    first_baseline = result.baseline_hr_bpm;
+    EXPECT(first_baseline == 73u);
+
+    for (i = 0; i < 150; ++i) {
+        t += 120u;
+        result = feed_quiet(&detector, t, 68);
+        EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
+    }
+
+    /* The baseline must converge on the real quiet-awake HR ... */
+    EXPECT(result.baseline_hr_bpm < first_baseline);
+    EXPECT(result.baseline_hr_bpm <= 69u);
+    /* ... so that sitting still stops looking like dozing. */
+    EXPECT(!result.hr_soft_drop);
+    EXPECT(!result.positive);
+    EXPECT(result.phase == NAP_DETECTOR_ARMED);
+}
+
 static void test_movement_resets_candidate(void) {
     NapDetector detector;
     NapDetectorResult result;
@@ -633,6 +675,7 @@ int main(void) {
     test_quiet_awake_has_no_action();
     test_real_doze_nudges_and_alarms_at_exact_boundaries();
     test_reported_zero_vmc_full_drop_nudges_before_three_minutes();
+    test_high_latched_baseline_recovers_downward();
     test_movement_resets_candidate();
     test_isolated_hr_outlier_is_median_filtered();
     test_soft_drop_plateau_sustains_candidate();
