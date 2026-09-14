@@ -47,7 +47,7 @@
 #define PERSIST_KEY_LAST_NUDGE          28
 #define PERSIST_KEY_DEBUG_PHASE         29
 #define PERSIST_KEY_WORKER_STATUS       30
-#define DETECTOR_SCHEMA_VERSION          1
+#define DETECTOR_SCHEMA_VERSION          2
 
 #define DEFAULT_ENABLED                  1
 #define DEFAULT_START_HOUR              11
