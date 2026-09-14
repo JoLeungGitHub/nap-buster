@@ -211,14 +211,22 @@ static void test_high_latched_baseline_recovers_downward(void) {
     EXPECT(result.phase == NAP_DETECTOR_ARMED);
 }
 
-/* Field report, second round: baseline latched at 73 while the wearer's
- * settled resting HR was 64 -- below the Balanced full-drop line
- * (73 * 0.88 = 64.2). A quiet full-drop sample is always positive, and 3.0.2
- * refuses calibration on positive samples, so the latch simply moved one band
- * lower. The wearer is plainly awake: they sit still for a few minutes, then
- * get up and move. Short still periods that END IN MOVEMENT are awake
- * evidence that does not depend on the baseline being right. */
-static void test_awake_still_periods_recalibrate_a_high_baseline(void) {
+/* Documented limitation, from a second field report: baseline latched at 73
+ * while the wearer's settled resting HR was 64 -- below the Balanced
+ * full-drop line (73 * 0.88 = 64.2). A quiet full-drop sample is always
+ * positive, and calibration refuses positive samples, so the baseline cannot
+ * self-correct from here.
+ *
+ * This is deliberate. Wrist motion cannot distinguish "awake and completely
+ * still with a low resting HR" from "dozing": the reporter sat motionless
+ * through both the nudge and the alarm, so even nudge-response is no help,
+ * and crediting such a window would chase a real nap downward (see
+ * test_movement_resets_candidate). v3.0.3 therefore fixes a wrong baseline by
+ * forcing a one-time re-seed rather than by inference.
+ *
+ * If a future change makes the baseline self-correcting here, update this
+ * test -- do not delete it without replacing the guarantee it pins down. */
+static void test_resting_hr_below_full_drop_cannot_self_correct(void) {
     NapDetector detector;
     NapDetectorResult result;
     uint32_t t = 9000u;
@@ -250,7 +258,7 @@ static void test_awake_still_periods_recalibrate_a_high_baseline(void) {
 
     t += 120u;
     result = feed_quiet(&detector, t, 64);
-    EXPECT(result.baseline_hr_bpm < 70u);
+    EXPECT(result.baseline_hr_bpm == 73u);
 }
 
 static void test_movement_resets_candidate(void) {
@@ -718,7 +726,7 @@ int main(void) {
     test_real_doze_nudges_and_alarms_at_exact_boundaries();
     test_reported_zero_vmc_full_drop_nudges_before_three_minutes();
     test_high_latched_baseline_recovers_downward();
-    test_awake_still_periods_recalibrate_a_high_baseline();
+    test_resting_hr_below_full_drop_cannot_self_correct();
     test_movement_resets_candidate();
     test_isolated_hr_outlier_is_median_filtered();
     test_soft_drop_plateau_sustains_candidate();

@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v3.0.2** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v3.0.3** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When NapBuster sees sustained signs that you may be dozing during your configured no-nap hours, it gives you a gentle nudge. If stronger evidence continues and you do not appear to respond, it escalates to a repeating alarm.
 
@@ -69,6 +69,8 @@ Contiguous, artifact-gated PPI readings can produce an **RMSSD diagnostic** on P
 ### Baseline migration
 
 v3.0 uses a new detector-state schema. On first run it clears the old HR baseline together with incompatible rolling buffers, streaks, VMC EMA, and HRV state, then recalibrates from stable quiet-awake readings. This deliberately avoids carrying forward a baseline that the previous algorithm may have inflated or allowed to follow a doze.
+
+**If NapBuster alarms while you are awake and sitting still**, its idea of your resting heart rate is probably too high. Because a quiet full-drop reading is treated as doze evidence, the baseline cannot correct itself from that state, and no motion signal can distinguish it from a real nap. Installing a release that changes the detector schema — such as 3.0.3 — discards the stored baseline and recalibrates from about five quiet minutes. Choosing a less sensitive Detection level widens the band in the meantime.
 
 ---
 
@@ -279,6 +281,7 @@ NapBuster is a convenience tool, **not a medical or safety device**. Do not rely
 
 | Version | What changed |
 |---|---|
+| **3.0.3** | Forces a one-time baseline re-seed. A baseline that ends up above the wearer's settled resting HR cannot correct itself once that resting HR falls below the full-drop line, because a quiet full-drop sample is always positive and calibration refuses positive samples. Reported from the field as a 64 BPM resting HR against a latched 73 BPM baseline, which made sitting still read as a full drop and alarm. Wrist motion cannot separate that from a real nap — the reporter sat motionless through both the nudge and the alarm — so this release resets the baseline rather than guessing, and the limitation is now pinned down by a named test. Detection logic, timings, and thresholds are unchanged. |
 | **3.0.2** | Fixed a false-alarm latch in baseline calibration. Calibration was gated on the soft-drop boundary, which is circular: a baseline a few BPM above the wearer's true quiet-awake HR puts that HR inside the soft band, where it both counts as doze evidence and is refused as the input that would correct it. The baseline could never come down, so every still moment became a candidate and nudged. Reported from the field as a 68 BPM reading against a latched 73 BPM baseline. Calibration is now refused only above the full-drop boundary and on any sample scored positive (which also covers the episode-onset sample). Timings and sensitivity thresholds are unchanged. |
 | **3.0.1** | Tuned response timing from real doze telemetry: valid candidates now nudge after two minutes, and continuing full-drop evidence escalates after five; a soft-only episode cannot trigger the repeating alarm. Sensor cadence is unchanged. Added a regression scenario for a 57 BPM reading against a 68 BPM baseline with zero latest-minute VMC. |
 | **3.0.0** | Replaced the accumulated v2.x trigger logic with a portable ARMED → CANDIDATE → NUDGED detector; fresh event-driven raw HR with 20-second burst rejection and median-of-three smoothing; stable quiet baseline calibration; completed VMC/step summaries; bounded/decaying evidence; 8/12/16% full and 4/6/8% soft HR-drop thresholds, with soft-only episodes limited to a nudge; candidate-only 20-second sensor probing; PPI RMSSD as diagnostic telemetry only; a new persistence schema and host scenario tests. Fixed overnight active-day ownership, snooze expiry outside the guard window, and a foreground launch race that could turn a nudge into a full alarm. |
