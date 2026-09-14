@@ -1,7 +1,7 @@
 /**
  * settings.c — NapBuster Settings Screen
  *
- * Five settings rows with dynamic visible count + scrollbar:
+ * Settings rows with dynamic visible count + scrollbar:
  *
  *   ROW 0  Guard          ON / OFF
  *   ROW 1  Active days    Every day / Weekdays / N days  → opens day picker
@@ -36,6 +36,8 @@ typedef enum {
     ROW_END_HOUR,
     ROW_VIBE_STRENGTH,
     ROW_SENSITIVITY,
+    ROW_RECALIBRATE,
+    ROW_VERSION,
     ROW_COUNT
 } SettingsRow;
 
@@ -45,7 +47,9 @@ static const char * const ROW_LABELS[ROW_COUNT] = {
     "No-nap from",
     "No-nap until",
     "Wake vibration",
-    "Detection"
+    "Detection",
+    "Recalibrate",
+    "Version"
 };
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
@@ -81,6 +85,9 @@ static int  s_selected_row  = 0;
 static int  s_scroll_offset = 0;
 static bool s_editing       = false;
 
+// Set when the user triggers a re-seed, so the row can confirm it happened.
+static bool s_recalibrated  = false;
+
 static char s_val_buf[ROW_COUNT][16];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -114,6 +121,12 @@ static void prv_format_value(int row, char *buf, size_t len) {
             snprintf(buf, len, "%s", sens_labels[idx]);
             break;
         }
+        case ROW_RECALIBRATE:
+            snprintf(buf, len, "%s", s_recalibrated ? "Done" : "Reset");
+            break;
+        case ROW_VERSION:
+            snprintf(buf, len, "%s", NAPBUSTER_VERSION);
+            break;
         default:
             buf[0] = '\0';
             break;
@@ -284,6 +297,22 @@ static void prv_select_click(ClickRecognizerRef r, void *ctx) {
         days_window_push();
         return;
     }
+    if (s_selected_row == ROW_RECALIBRATE) {
+        /* A baseline that has drifted above the wearer's true resting HR
+         * cannot correct itself: a quiet full-drop reading counts as doze
+         * evidence, and calibration refuses positive samples. Clearing it is
+         * the only way out, so expose that here rather than requiring a
+         * release with a detector-schema bump. */
+        persist_delete(PERSIST_KEY_HR_BASELINE);
+        AppWorkerMessage reseed = { .data0 = APP_MSG_RECALIBRATE };
+        app_worker_send_message(APP_MSG_RECALIBRATE, &reseed);
+        s_recalibrated = true;
+        prv_refresh();
+        return;
+    }
+    if (s_selected_row == ROW_VERSION) {
+        return;  // read-only
+    }
     s_editing = !s_editing;
     prv_refresh();
 }
@@ -309,6 +338,7 @@ static void prv_window_load(Window *window) {
     s_selected_row  = 0;
     s_scroll_offset = 0;
     s_editing       = false;
+    s_recalibrated  = false;
 
     Layer *root   = window_get_root_layer(window);
     GRect  bounds = layer_get_bounds(root);

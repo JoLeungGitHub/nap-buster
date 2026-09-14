@@ -61,6 +61,7 @@
 #define APP_MSG_SNOOZE_30               11
 #define APP_MSG_DISMISS                 12
 #define APP_MSG_SETTINGS_CHANGED       13
+#define APP_MSG_RECALIBRATE             14
 
 #define WARM_LEAD_HOURS                  2
 #define HR_ARMED_PERIOD_SECS           120
@@ -923,6 +924,18 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *message) {
             persist_delete(PERSIST_KEY_NUDGE_PENDING);
             prv_reset_episode();
             prv_set_sensor_periods();
+            break;
+
+        case APP_MSG_RECALIBRATE:
+            // Deleting the stored value is not enough: the live detector holds
+            // the baseline in RAM and would write it back on its next change.
+            nap_detector_restore_baseline(&s_detector, 0);
+            s_saved_baseline = 0;
+            persist_delete(PERSIST_KEY_HR_BASELINE);
+            prv_reset_episode();
+            prv_write_status();
+            APP_LOG(APP_LOG_LEVEL_INFO,
+                    "NapBuster: baseline cleared, recalibrating");
             break;
 
         case APP_MSG_SETTINGS_CHANGED:
