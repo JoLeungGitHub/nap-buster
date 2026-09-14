@@ -23,6 +23,16 @@ jobs:
       - name: Build and run portable detector tests
         run: make -C tests test
 
+      - name: Version constants agree
+        run: |
+          PKG=$(grep -m1 '"version"' package.json | tr -d ' ",' | cut -d: -f2)
+          SRC=$(grep -m1 NAPBUSTER_VERSION src/c/common.h | tr -d ' "' | sed 's/.*NAPBUSTER_VERSION//')
+          echo "package.json=$PKG  common.h=$SRC"
+          if [ "$PKG" != "$SRC" ]; then
+            echo "::error::NAPBUSTER_VERSION ($SRC) does not match package.json ($PKG); bump both"
+            exit 1
+          fi
+
   pebble-build:
     runs-on: ubuntu-latest
     timeout-minutes: 30

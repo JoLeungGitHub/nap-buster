@@ -37,6 +37,10 @@
 #define PERSIST_KEY_DEBUG_PHASE      29  // int: 0=Armed 1=Candidate 2=Nudged
 #define PERSIST_KEY_WORKER_STATUS    30  // uint8 bitmask: worker/sensor readiness
 
+/* Shown in Settings so the installed build is identifiable on the watch.
+ * CI asserts this matches package.json; bump both together. */
+#define NAPBUSTER_VERSION            "3.0.4"
+
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
 #define DEFAULT_START_HOUR           11  // 11:00 AM
@@ -52,6 +56,7 @@
 #define APP_MSG_SNOOZE_30            11
 #define APP_MSG_DISMISS              12
 #define APP_MSG_SETTINGS_CHANGED     13
+#define APP_MSG_RECALIBRATE          14  // user asked to re-seed the HR baseline
 
 // ─── Wakeup Reason Codes ──────────────────────────────────────────────────────
 #define WAKEUP_REASON_SNOOZE         42
