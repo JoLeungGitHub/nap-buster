@@ -369,7 +369,9 @@ static bool prv_is_snoozed(void) {
     if (!persist_exists(PERSIST_KEY_SNOOZE_UNTIL)) return false;
     time_t until = (time_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL);
     time_t now = time(NULL);
-    if (until > now && (until - now) <= NAP_MAX_SNOOZE_SECONDS) return true;
+    if (until > now && (until - now) <= (time_t)NAP_MAX_SNOOZE_SECONDS) {
+        return true;
+    }
 
     // Expired, implausibly far-future, or clock-warped values cannot disable
     // the detector indefinitely.
