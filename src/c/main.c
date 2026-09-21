@@ -125,8 +125,17 @@ static void vibe_timer_callback(void *ctx) {
 
 // ─── Alarm Control ───────────────────────────────────────────────────────────
 
+static bool prv_alert_delivery_allowed(void) {
+    return nap_alert_allowed((uint32_t)time(NULL), settings_get_enabled(),
+        is_in_no_nap_window(),
+        persist_exists(PERSIST_KEY_SNOOZE_UNTIL)
+            ? (uint32_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL) : 0u,
+        persist_exists(PERSIST_KEY_LAST_DISMISS)
+            ? (uint32_t)persist_read_int(PERSIST_KEY_LAST_DISMISS) : 0u);
+}
+
 static void start_alarm(void) {
-    if (s_is_alarming) return;
+    if (s_is_alarming || !prv_alert_delivery_allowed()) return;
     s_is_alarming = true;
     persist_write_int(PERSIST_KEY_ALARMING, 1);
     // Timestamp lets the worker recognise (and clear) a flag left set by an
@@ -137,7 +146,9 @@ static void start_alarm(void) {
 
     text_layer_set_text(s_state_label,  "WAKE UP!");
     text_layer_set_text(s_time_label,   "(>_<)");
-    text_layer_set_text(s_detail_label, "You dozed off!");
+    int source = persist_read_int(PERSIST_KEY_LAST_ALERT_SOURCE);
+    text_layer_set_text(s_detail_label, source == ALERT_SOURCE_OS_SLEEP
+        ? "Watch reported sleep" : "Possible doze");
     text_layer_set_text(s_days_label,   "");
     text_layer_set_text(s_hint_label,   "");  // side labels take over
 
@@ -164,6 +175,8 @@ static void stop_alarm(void) {
         s_vibe_timer = NULL;
     }
     vibes_cancel();
+    // Publish the veto before clearing ALARMING: the worker runs separately.
+    persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
     persist_write_int(PERSIST_KEY_ALARMING, 0);
     persist_delete(PERSIST_KEY_ALARM_START);
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
@@ -172,7 +185,6 @@ static void stop_alarm(void) {
     // Tell the worker the alarm was acknowledged: it resets candidate
     // evidence, and the persisted timestamp gives it a short re-fire cooldown
     // (Tier 2's sleep classification stays stale for a while after waking).
-    persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
     AppWorkerMessage msg = { .data0 = APP_MSG_DISMISS };
     app_worker_send_message(APP_MSG_DISMISS, &msg);
 
@@ -243,6 +255,7 @@ static void update_home_screen(void) {
     // make the worker refuse to launch an alarm ever again.
     if (persist_exists(PERSIST_KEY_ALARMING) &&
         persist_read_int(PERSIST_KEY_ALARMING)) {
+        persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
         persist_write_int(PERSIST_KEY_ALARMING, 0);
         persist_delete(PERSIST_KEY_ALARM_START);
         AppWorkerMessage heal = { .data0 = APP_MSG_DISMISS };
@@ -466,7 +479,8 @@ static void worker_message_handler(uint16_t type, AppWorkerMessage *msg) {
     } else if (type == WORKER_MSG_NAP_NUDGE) {
         // App was already open — just do the nudge pulse, no alarm
         persist_delete(PERSIST_KEY_NUDGE_PENDING);
-        vibes_double_pulse();
+        if (prv_alert_delivery_allowed()) vibes_double_pulse();
+        update_home_screen();
     }
 }
 
@@ -678,7 +692,7 @@ static void app_init(void) {
         if (worker_launch_is_nudge) {
             // Nudge mode: double pulse, show home screen, no alarm
             persist_delete(PERSIST_KEY_NUDGE_PENDING);
-            vibes_double_pulse();
+            if (prv_alert_delivery_allowed()) vibes_double_pulse();
         } else {
             start_alarm();
         }
@@ -711,9 +725,9 @@ static void app_deinit(void) {
     // permanently deaf; the vibration has already stopped either way.
     if (s_is_alarming) {
         s_is_alarming = false;
+        persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
         persist_write_int(PERSIST_KEY_ALARMING, 0);
         persist_delete(PERSIST_KEY_ALARM_START);
-        persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
         AppWorkerMessage msg = { .data0 = APP_MSG_DISMISS };
         app_worker_send_message(APP_MSG_DISMISS, &msg);
     }

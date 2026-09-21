@@ -1,0 +1,143 @@
+#include "../src/common/alert_policy.h"
+#include "../worker_src/c/sleep_fallback.h"
+
+#include <stdio.h>
+
+static unsigned int failures;
+#define EXPECT(expression) do { \
+    if (!(expression)) { \
+        (void)fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, \
+                      #expression); \
+        failures++; \
+    } \
+} while (0)
+
+static NapDetectorResult analyze(NapDetector *detector, uint32_t now,
+                                 int16_t hr, uint32_t vmc) {
+    NapDetectorSample sample = {0};
+    sample.timestamp = now;
+    sample.heart_rate_bpm = hr;
+    sample.motion.latest_timestamp = now;
+    sample.motion.latest_vmc = vmc;
+    sample.motion.mean_vmc = vmc;
+    sample.motion.peak_vmc = vmc;
+    sample.motion.valid_minutes = 5u;
+    sample.motion.quiet_minutes = vmc < 100u ? 5u : 0u;
+    return nap_detector_process(detector, &sample);
+}
+
+static void test_dismiss_between_dispatch_and_delivery(void) {
+    /* An alert was valid when queued. SELECT is pressed before another
+     * message or worker launch arrives, including after foreground restart. */
+    uint32_t queued_at = 1000u;
+    uint32_t dismissed_at = queued_at + 1u;
+    EXPECT(nap_alert_allowed(queued_at, true, true, 0u, 0u));
+    EXPECT(!nap_alert_allowed(dismissed_at, true, true, 0u, dismissed_at));
+    EXPECT(!nap_alert_allowed(dismissed_at + 1u, true, true, 0u, dismissed_at));
+    EXPECT(!nap_alert_allowed(dismissed_at + 60u, true, true, 0u, dismissed_at));
+    EXPECT(!nap_alert_allowed(dismissed_at + 599u, true, true, 0u, dismissed_at));
+    EXPECT(nap_alert_allowed(dismissed_at + 600u, true, true, 0u, dismissed_at));
+
+    EXPECT(!nap_alert_allowed(1001u, true, true, 1600u, 0u));
+    EXPECT(nap_alert_allowed(1600u, true, true, 1600u, 0u));
+    EXPECT(!nap_alert_allowed(1001u, false, true, 0u, 0u));
+    EXPECT(!nap_alert_allowed(1001u, true, false, 0u, 0u));
+    /* Invalid future timestamps must not suppress monitoring indefinitely. */
+    EXPECT(nap_alert_allowed(1000u, true, true, 99999u, 2000u));
+}
+
+static void test_reported_awake_reading_contradicts_os_sleep(void) {
+    for (int sensitivity = NAP_DETECTOR_SENSITIVE;
+         sensitivity <= NAP_DETECTOR_CONSERVATIVE; ++sensitivity) {
+        NapDetector detector;
+        nap_detector_init(&detector, (NapDetectorSensitivity)sensitivity);
+        nap_detector_restore_baseline(&detector, 88u);
+        (void)analyze(&detector, 1000u, 86, 221u);
+        (void)analyze(&detector, 1120u, 86, 221u);
+        NapDetectorResult result = analyze(&detector, 1240u, 86, 221u);
+        EXPECT(result.smoothed_hr_bpm == 86u);
+        EXPECT(result.baseline_hr_bpm == 88u);
+        EXPECT(result.action == NAP_DETECTOR_ACTION_NONE);
+        EXPECT(result.phase == NAP_DETECTOR_ARMED);
+        EXPECT(result.evidence_seconds == 0u);
+        EXPECT(nap_sleep_fallback_contradicted(&result, true, 1240u,
+                                               1240u, 1300u));
+        bool handled = false;
+        EXPECT(!nap_sleep_fallback_update(&handled, true, false, true));
+        EXPECT(!handled); /* A later genuinely supporting reading may alert. */
+    }
+
+    /* Sitting completely still with the same awake-range HR must also veto
+     * the fallback. No need to move to prove wakefulness to this policy. */
+    NapDetector detector;
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 88u);
+    (void)analyze(&detector, 1000u, 86, 0u);
+    (void)analyze(&detector, 1120u, 86, 0u);
+    NapDetectorResult result = analyze(&detector, 1240u, 86, 0u);
+    EXPECT(result.quiet);
+    EXPECT(!result.movement);
+    EXPECT(nap_sleep_fallback_contradicted(&result, true, 1240u, 1240u, 1240u));
+}
+
+static void test_same_os_sleep_episode_stays_acknowledged(void) {
+    bool handled = false;
+    EXPECT(nap_sleep_fallback_update(&handled, true, false, false));
+    handled = true; /* Successful dispatch: one alarm for this OS episode. */
+    EXPECT(!nap_sleep_fallback_update(&handled, true, true, false));
+    /* Cooldown expires, but the same OS label is still not a new nap. */
+    EXPECT(!nap_sleep_fallback_update(&handled, true, false, false));
+    bool restored = handled; /* Worker restart restores the persisted latch. */
+    EXPECT(!nap_sleep_fallback_update(&restored, true, false, false));
+    EXPECT(!nap_sleep_fallback_update(&restored, false, false, false));
+    EXPECT(!restored);
+    EXPECT(nap_sleep_fallback_update(&restored, true, false, false));
+
+    /* An acknowledgement recovered from persisted dismiss/snooze state
+     * works even if the app-to-worker message was dropped. */
+    handled = false;
+    EXPECT(!nap_sleep_fallback_update(&handled, true, true, false));
+    EXPECT(handled);
+    EXPECT(!nap_sleep_fallback_update(&handled, true, false, false));
+}
+
+static void test_supporting_hr_and_missing_data_keep_fallback(void) {
+    NapDetector detector;
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 68u);
+    (void)analyze(&detector, 1000u, 57, 0u);
+    (void)analyze(&detector, 1120u, 57, 0u);
+    NapDetectorResult result = analyze(&detector, 1240u, 57, 0u);
+    EXPECT(result.hr_full_drop);
+    EXPECT(!nap_sleep_fallback_contradicted(&result, true, 1240u, 1240u, 1240u));
+
+    result = (NapDetectorResult){0}; /* Watch with no HR / unavailable data. */
+    EXPECT(!nap_sleep_fallback_contradicted(&result, false, 0u, 0u, 1240u));
+    result.hr_valid = true;
+    result.baseline_hr_bpm = 88u;
+    EXPECT(!nap_sleep_fallback_contradicted(&result, false, 1240u, 1240u, 1240u));
+    result.baseline_hr_bpm = 0u; /* Calibration incomplete. */
+    EXPECT(!nap_sleep_fallback_contradicted(&result, true, 1240u, 1240u, 1240u));
+    result.baseline_hr_bpm = 88u;
+    EXPECT(nap_sleep_fallback_contradicted(&result, true, 1240u, 1240u, 1480u));
+    EXPECT(!nap_sleep_fallback_contradicted(&result, true, 1240u, 1240u, 1481u));
+    EXPECT(!nap_sleep_fallback_contradicted(&result, true, 1240u, 1240u, 1200u));
+
+    result.hr_valid = false;
+    result.movement = true;
+    result.motion_fresh = true;
+    EXPECT(nap_sleep_fallback_contradicted(&result, false, 1240u, 1200u, 1320u));
+    EXPECT(!nap_sleep_fallback_contradicted(&result, false, 1240u, 1200u, 1321u));
+    result.motion_fresh = false;
+    EXPECT(!nap_sleep_fallback_contradicted(&result, false, 1240u, 1240u, 1240u));
+}
+
+int main(void) {
+    test_dismiss_between_dispatch_and_delivery();
+    test_reported_awake_reading_contradicts_os_sleep();
+    test_same_os_sleep_episode_stays_acknowledged();
+    test_supporting_hr_and_missing_data_keep_fallback();
+    if (failures != 0u) return 1;
+    (void)puts("alert_policy: all regression tests passed");
+    return 0;
+}

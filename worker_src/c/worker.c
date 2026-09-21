@@ -10,6 +10,8 @@
 #include <pebble_worker.h>
 
 #include "nap_detector.h"
+#include "sleep_fallback.h"
+#include "../../src/common/alert_policy.h"
 
 #include <string.h>
 
@@ -47,7 +49,13 @@
 #define PERSIST_KEY_LAST_NUDGE          28
 #define PERSIST_KEY_DEBUG_PHASE         29
 #define PERSIST_KEY_WORKER_STATUS       30
+#define PERSIST_KEY_OS_SLEEP_HANDLED    31
+#define PERSIST_KEY_LAST_ALERT_SOURCE   32
 #define DETECTOR_SCHEMA_VERSION          2
+
+#define ALERT_SOURCE_HR                  1
+#define ALERT_SOURCE_OS_SLEEP            2
+#define ALERT_SOURCE_NUDGE               3
 
 #define DEFAULT_ENABLED                  1
 #define DEFAULT_START_HOUR              11
@@ -72,8 +80,6 @@
 #define MOTION_WINDOW_MINUTES            5
 #define MOTION_QUIET_VMC_MAX           100
 #define NUDGE_COOLDOWN_SECS             600
-#define DISMISS_COOLDOWN_SECS           600
-#define SNOOZE_MAX_SECS                7200
 #define ALARM_STALE_SECS               1800
 #define LAUNCH_PENDING_SECS             300
 
@@ -119,6 +125,10 @@ static bool s_observed_alarming;
 static int16_t s_last_hr_bpm;
 static time_t s_last_hr_time;
 static time_t s_last_accepted_hr_time;
+static NapDetectorResult s_last_analysis;
+static bool s_last_analysis_smoothed;
+static uint32_t s_last_analysis_time;
+static uint32_t s_last_analysis_motion_time;
 static uint16_t s_ppi_ring[PPI_RING_SIZE];
 static uint8_t s_ppi_count;
 static uint8_t s_ppi_index;
@@ -359,7 +369,7 @@ static bool prv_is_snoozed(void) {
     if (!persist_exists(PERSIST_KEY_SNOOZE_UNTIL)) return false;
     time_t until = (time_t)persist_read_int(PERSIST_KEY_SNOOZE_UNTIL);
     time_t now = time(NULL);
-    if (until > now && (until - now) <= SNOOZE_MAX_SECS) return true;
+    if (until > now && (until - now) <= NAP_MAX_SNOOZE_SECONDS) return true;
 
     // Expired, implausibly far-future, or clock-warped values cannot disable
     // the detector indefinitely.
@@ -393,8 +403,8 @@ static bool prv_dismiss_cooldown_active(void) {
     if (!persist_exists(PERSIST_KEY_LAST_DISMISS)) return false;
     time_t last = (time_t)persist_read_int(PERSIST_KEY_LAST_DISMISS);
     time_t now = time(NULL);
-    if (last > 0 && now >= last &&
-        (now - last) < DISMISS_COOLDOWN_SECS) {
+    if (last > 0 && nap_dismiss_cooldown_active((uint32_t)now,
+                                               (uint32_t)last)) {
         return true;
     }
     persist_delete(PERSIST_KEY_LAST_DISMISS);
@@ -504,6 +514,7 @@ static bool prv_fire_nudge(void) {
     if (!prv_launch_allowed(true)) return false;
 
     s_last_nudge_time = time(NULL);
+    persist_write_int(PERSIST_KEY_LAST_ALERT_SOURCE, ALERT_SOURCE_NUDGE);
     persist_write_int(PERSIST_KEY_LAST_NUDGE, (int)s_last_nudge_time);
     persist_write_int(PERSIST_KEY_NUDGE_PENDING, 1);
     AppWorkerMessage message = { .data0 = WORKER_MSG_NAP_NUDGE };
@@ -515,16 +526,18 @@ static bool prv_fire_nudge(void) {
     return true;
 }
 
-static bool prv_fire_alarm(void) {
+static bool prv_fire_alarm(int source) {
     if (!prv_launch_allowed(false)) return false;
 
+    persist_write_int(PERSIST_KEY_LAST_ALERT_SOURCE, source);
     persist_delete(PERSIST_KEY_NUDGE_PENDING);
     s_launch_pending = true;
     s_launch_pending_time = time(NULL);
     AppWorkerMessage message = { .data0 = WORKER_MSG_SLEEP_DETECTED };
     app_worker_send_message(WORKER_MSG_SLEEP_DETECTED, &message);
     worker_launch_app();
-    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: full alarm launched");
+    APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: full alarm launched, source=%d",
+            source);
     return true;
 }
 
@@ -786,7 +799,18 @@ static void prv_analyze_heart_rate(int16_t heart_rate_bpm) {
     if (!result.sample_accepted) return;
     s_last_accepted_hr_time = now;
     s_last_motion_fresh = result.motion_fresh;
+    s_last_analysis = result;
+    s_last_analysis_smoothed =
+        s_detector.hr_count == NAP_DETECTOR_HR_WINDOW_SIZE;
+    s_last_analysis_time = (uint32_t)now;
+    s_last_analysis_motion_time = sample.motion.latest_timestamp;
     prv_save_baseline_if_changed();
+
+    // Save the triggering reading before the foreground can display it.
+    int rmssd = prv_current_rmssd();
+    prv_write_analysis_telemetry(
+        result.smoothed_hr_bpm, &sample.motion, rmssd, now,
+        result.action != NAP_DETECTOR_ACTION_NONE);
 
     if (!s_window_active && s_detector.phase != NAP_DETECTOR_ARMED) {
         // The lead-in may seed the slow awake baseline, but it must never carry
@@ -796,13 +820,9 @@ static void prv_analyze_heart_rate(int16_t heart_rate_bpm) {
     } else if (result.action == NAP_DETECTOR_ACTION_NUDGE) {
         if (!prv_fire_nudge()) prv_reset_episode();
     } else if (result.action == NAP_DETECTOR_ACTION_ALARM) {
-        if (!prv_fire_alarm()) prv_reset_episode();
+        if (!prv_fire_alarm(ALERT_SOURCE_HR)) prv_reset_episode();
     }
 
-    int rmssd = prv_current_rmssd();
-    prv_write_analysis_telemetry(
-        result.smoothed_hr_bpm, &sample.motion, rmssd, now,
-        result.action != NAP_DETECTOR_ACTION_NONE);
     prv_set_sensor_periods();
 
     APP_LOG(APP_LOG_LEVEL_DEBUG,
@@ -815,14 +835,22 @@ static void prv_analyze_heart_rate(int16_t heart_rate_bpm) {
 
 static void prv_check_tier2_sleep(void) {
     HealthActivityMask activity = health_service_peek_current_activities();
-    if ((activity & HealthActivitySleep) ||
-        (activity & HealthActivityRestfulSleep)) {
-        if (!prv_fire_alarm()) {
-            // Policy blocked the action; do not leave a consumed Tier-1 action
-            // silently latched behind the foreground state.
-            prv_reset_episode();
-            prv_set_sensor_periods();
-        }
+    bool asleep = (activity & (HealthActivitySleep |
+                              HealthActivityRestfulSleep)) != 0;
+    bool handled = persist_exists(PERSIST_KEY_OS_SLEEP_HANDLED) &&
+                   persist_read_int(PERSIST_KEY_OS_SLEEP_HANDLED);
+    bool was_handled = handled;
+    bool acknowledged = prv_is_snoozed() || prv_dismiss_cooldown_active();
+    bool contradicted = nap_sleep_fallback_contradicted(
+        &s_last_analysis, s_last_analysis_smoothed, s_last_analysis_time,
+        s_last_analysis_motion_time, (uint32_t)time(NULL));
+    if (nap_sleep_fallback_update(&handled, asleep, acknowledged,
+                                  contradicted) &&
+        prv_fire_alarm(ALERT_SOURCE_OS_SLEEP)) {
+        handled = true;
+    }
+    if (handled != was_handled) {
+        persist_write_int(PERSIST_KEY_OS_SLEEP_HANDLED, handled);
     }
 }
 
@@ -880,6 +908,9 @@ static void prv_minute_tick(struct tm *tick_time, TimeUnits units_changed) {
         APP_LOG(APP_LOG_LEVEL_INFO, "NapBuster: heart rate became available");
     }
     prv_apply_window_state();
+    // Observe awake transitions even without a sleep event, and remember a
+    // dismissal even if its message was lost. This does not request sensors.
+    if (s_window_active && s_health_subscribed) prv_check_tier2_sleep();
 }
 
 static void prv_health_event_handler(HealthEventType event, void *context) {
@@ -918,18 +949,25 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *message) {
         case APP_MSG_DISMISS:
         case APP_MSG_SNOOZE_10:
         case APP_MSG_SNOOZE_30:
+            // Recover acknowledgement even for the foreground's stale-alarm
+            // repair path, or if only the message reached us.
+            if (type == APP_MSG_DISMISS && !prv_dismiss_cooldown_active()) {
+                persist_write_int(PERSIST_KEY_LAST_DISMISS, (int)time(NULL));
+            }
             s_launch_pending = false;
             s_launch_pending_time = 0;
             s_observed_alarming = false;
             persist_delete(PERSIST_KEY_NUDGE_PENDING);
             prv_reset_episode();
             prv_set_sensor_periods();
+            if (s_window_active && s_health_subscribed) prv_check_tier2_sleep();
             break;
 
         case APP_MSG_RECALIBRATE:
             // Deleting the stored value is not enough: the live detector holds
             // the baseline in RAM and would write it back on its next change.
             nap_detector_restore_baseline(&s_detector, 0);
+            s_last_analysis_time = 0;
             s_saved_baseline = 0;
             persist_delete(PERSIST_KEY_HR_BASELINE);
             prv_reset_episode();
@@ -941,6 +979,9 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *message) {
         case APP_MSG_SETTINGS_CHANGED:
             s_launch_pending = false;
             s_launch_pending_time = 0;
+            if (s_detector.sensitivity != prv_get_sensitivity()) {
+                s_last_analysis_time = 0;
+            }
             nap_detector_set_sensitivity(&s_detector,
                                          prv_get_sensitivity());
             prv_reset_episode();

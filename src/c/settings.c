@@ -37,6 +37,7 @@ typedef enum {
     ROW_VIBE_STRENGTH,
     ROW_SENSITIVITY,
     ROW_RECALIBRATE,
+    ROW_LAST_ALERT,
     ROW_VERSION,
     ROW_COUNT
 } SettingsRow;
@@ -49,6 +50,7 @@ static const char * const ROW_LABELS[ROW_COUNT] = {
     "Wake vibration",
     "Detection",
     "Recalibrate",
+    "Last alert",
     "Version"
 };
 
@@ -127,6 +129,13 @@ static void prv_format_value(int row, char *buf, size_t len) {
         case ROW_VERSION:
             snprintf(buf, len, "%s", NAPBUSTER_VERSION);
             break;
+        case ROW_LAST_ALERT: {
+            int source = persist_read_int(PERSIST_KEY_LAST_ALERT_SOURCE);
+            snprintf(buf, len, "%s", source == ALERT_SOURCE_OS_SLEEP
+                ? "OS sleep" : source == ALERT_SOURCE_HR ? "HR drop"
+                : source == ALERT_SOURCE_NUDGE ? "Nudge" : "None");
+            break;
+        }
         default:
             buf[0] = '\0';
             break;
@@ -310,7 +319,7 @@ static void prv_select_click(ClickRecognizerRef r, void *ctx) {
         prv_refresh();
         return;
     }
-    if (s_selected_row == ROW_VERSION) {
+    if (s_selected_row == ROW_VERSION || s_selected_row == ROW_LAST_ALERT) {
         return;  // read-only
     }
     s_editing = !s_editing;

@@ -30,7 +30,7 @@ Timestamped HR event + newest five completed motion minutes
 The background worker has two detection tiers:
 
 - **Tier 1 — early doze detector:** available on watches with a heart-rate sensor. It evaluates each real HR event against an awake baseline and a timestamped summary of the newest five completed `HealthMinuteData` records (VMC and steps).
-- **Tier 2 — OS sleep fallback:** Pebble Health's own sleep classification remains a safety net on every supported watch. It is slower and can miss short naps, so it is not the primary early-warning path.
+- **Tier 2 — OS sleep fallback:** Pebble Health's own sleep classification remains a safety net on every supported watch. A fresh, fully smoothed HR reading above the full-drop threshold, or fresh clear movement, blocks this fallback. Missing or stale readings do not block it. A continuous OS sleep report can alert once; after an alert or acknowledgement, it rearms only when the OS reports awake. Tier 1 can still detect a new episode independently after the dismissal cooldown.
 
 ### ARMED → CANDIDATE → NUDGED
 
@@ -70,7 +70,9 @@ Contiguous, artifact-gated PPI readings can produce an **RMSSD diagnostic** on P
 
 v3.0 uses a new detector-state schema. On first run it clears the old HR baseline together with incompatible rolling buffers, streaks, VMC EMA, and HRV state, then recalibrates from stable quiet-awake readings. This deliberately avoids carrying forward a baseline that the previous algorithm may have inflated or allowed to follow a doze.
 
-**If NapBuster alarms while you are awake and sitting still**, its idea of your resting heart rate is probably too high. Because a quiet full-drop reading is treated as doze evidence, the baseline cannot correct itself from that state, and no motion signal can distinguish it from a real nap. Open Settings and press SELECT on **Recalibrate**: the stored baseline is discarded and measured again from about five quiet minutes of wear. Nothing can alert while it is recalibrating. Choosing a less sensitive Detection level widens the band in the meantime.
+**If NapBuster alarms while you are awake and sitting still**, check **Settings → Last alert** first. `OS sleep` means Pebble's sleep classification triggered it; `HR drop` means the main detector did. For repeated HR-drop alarms, the resting baseline may be too high. Open Settings and press SELECT on **Recalibrate** to discard it and measure it again from quiet readings. The HR detector cannot alert until calibration completes; the OS fallback remains available. Choosing a less sensitive Detection level widens the HR-drop band.
+
+Dismissal blocks new alerts for ten minutes, including queued messages or worker launches delivered after the button press. The cooldown is checked by both the worker and the foreground app. Snooze and guard settings are also rechecked at delivery. v3.0.5 adds these delivery checks and the OS sleep safeguards without changing Tier 1 thresholds or HR sampling periods.
 
 ---
 
@@ -102,6 +104,7 @@ Open settings from the main screen with a **long-press on SELECT**.
 | **Wake vibration** | Alarm pulse density | Medium |
 | **Detection** | HR-drop sensitivity | Balanced |
 | **Recalibrate** | Clears the learned HR baseline so it is measured again | — |
+| **Last alert** | Last dispatched source: HR drop, OS sleep, or Nudge; read-only | None |
 | **Version** | Installed build, read-only | — |
 
 For a window crossing midnight, the after-midnight portion belongs to the day on which the window started. For example, Monday-only 22:00–06:00 remains active until 06:00 Tuesday. Setting the same start and end hour means all day; use **Guard** to disable monitoring.

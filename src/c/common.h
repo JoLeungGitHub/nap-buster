@@ -7,6 +7,7 @@
 
 #pragma once
 #include <pebble.h>
+#include "../common/alert_policy.h"
 
 // ─── Persist Keys ────────────────────────────────────────────────────────────
 #define PERSIST_KEY_ENABLED          0  // bool: master on/off
@@ -36,10 +37,16 @@
 #define PERSIST_KEY_LAST_NUDGE       28  // time_t: last nudge (cooldown and diagnostics)
 #define PERSIST_KEY_DEBUG_PHASE      29  // int: 0=Armed 1=Candidate 2=Nudged
 #define PERSIST_KEY_WORKER_STATUS    30  // uint8 bitmask: worker/sensor readiness
+#define PERSIST_KEY_OS_SLEEP_HANDLED 31 // bool: this OS sleep episode was acknowledged
+#define PERSIST_KEY_LAST_ALERT_SOURCE 32 // int: latest dispatched alert source
+
+#define ALERT_SOURCE_HR             1
+#define ALERT_SOURCE_OS_SLEEP       2
+#define ALERT_SOURCE_NUDGE          3
 
 /* Shown in Settings so the installed build is identifiable on the watch.
  * CI asserts this matches package.json; bump both together. */
-#define NAPBUSTER_VERSION            "3.0.4"
+#define NAPBUSTER_VERSION            "3.0.5"
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
