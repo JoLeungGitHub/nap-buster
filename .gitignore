@@ -11,3 +11,5 @@ build/
 # Portable detector test binary
 tests/test_nap_detector
 tests/test_nap_detector.exe
+tests/test_alert_policy
+tests/test_alert_policy.exe
