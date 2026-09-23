@@ -51,11 +51,13 @@
 #define PERSIST_KEY_WORKER_STATUS       30
 #define PERSIST_KEY_OS_SLEEP_HANDLED    31
 #define PERSIST_KEY_LAST_ALERT_SOURCE   32
+#define PERSIST_KEY_SNOOZE_CHECK        33
 #define DETECTOR_SCHEMA_VERSION          2
 
 #define ALERT_SOURCE_HR                  1
 #define ALERT_SOURCE_OS_SLEEP            2
 #define ALERT_SOURCE_NUDGE               3
+#define ALERT_SOURCE_SNOOZE              4
 
 #define DEFAULT_ENABLED                  1
 #define DEFAULT_START_HOUR              11
@@ -70,6 +72,7 @@
 #define APP_MSG_DISMISS                 12
 #define APP_MSG_SETTINGS_CHANGED       13
 #define APP_MSG_RECALIBRATE             14
+#define APP_MSG_SNOOZE_EXPIRED          15
 
 #define WARM_LEAD_HOURS                  2
 #define HR_ARMED_PERIOD_SECS           120
@@ -886,6 +889,37 @@ static void prv_apply_window_state(void) {
     }
 }
 
+/* Decide a snooze that has just ended. The foreground persists the request,
+ * so a dropped prompt or a worker restart cannot lose it: the minute tick
+ * re-checks, and nap_snooze_check_decide() bounds how long it may wait. */
+static void prv_process_snooze_check(void) {
+    if (!persist_exists(PERSIST_KEY_SNOOZE_CHECK)) return;
+    uint32_t requested = (uint32_t)persist_read_int(PERSIST_KEY_SNOOZE_CHECK);
+    NapSnoozeCheck decision = nap_snooze_check_decide(
+        requested, (uint32_t)time(NULL), &s_last_analysis,
+        s_last_analysis_smoothed, s_last_analysis_time,
+        s_last_analysis_motion_time);
+    if (decision == NAP_SNOOZE_CHECK_WAIT) return;
+
+    persist_delete(PERSIST_KEY_SNOOZE_CHECK);
+    switch (decision) {
+        case NAP_SNOOZE_CHECK_RING:
+            if (!prv_fire_alarm(ALERT_SOURCE_SNOOZE)) {
+                APP_LOG(APP_LOG_LEVEL_INFO,
+                        "NapBuster: snooze re-ring blocked by alert policy");
+            }
+            break;
+        case NAP_SNOOZE_CHECK_RESUME:
+            APP_LOG(APP_LOG_LEVEL_INFO,
+                    "NapBuster: snooze ended while awake; guarding resumed");
+            break;
+        default:
+            APP_LOG(APP_LOG_LEVEL_WARNING,
+                    "NapBuster: stale snooze check discarded");
+            break;
+    }
+}
+
 static void prv_minute_tick(struct tm *tick_time, TimeUnits units_changed) {
     (void)tick_time;
     (void)units_changed;
@@ -913,6 +947,8 @@ static void prv_minute_tick(struct tm *tick_time, TimeUnits units_changed) {
     // Observe awake transitions even without a sleep event, and remember a
     // dismissal even if its message was lost. This does not request sensors.
     if (s_window_active && s_health_subscribed) prv_check_tier2_sleep();
+    // Backstop for a snooze check whose prompt message was lost.
+    prv_process_snooze_check();
 }
 
 static void prv_health_event_handler(HealthEventType event, void *context) {
@@ -963,6 +999,10 @@ static void prv_app_message_handler(uint16_t type, AppWorkerMessage *message) {
             prv_reset_episode();
             prv_set_sensor_periods();
             if (s_window_active && s_health_subscribed) prv_check_tier2_sleep();
+            break;
+
+        case APP_MSG_SNOOZE_EXPIRED:
+            prv_process_snooze_check();
             break;
 
         case APP_MSG_RECALIBRATE:

@@ -1,6 +1,6 @@
 # NapBuster ⌚
 
-**v3.0.4** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
+**v3.0.6** — A Pebble smartwatch app that stops you from napping during the day so you can fall asleep easier at night.
 
 When NapBuster sees sustained signs that you may be dozing during your configured no-nap hours, it gives you a gentle nudge. If stronger evidence continues and you do not appear to respond, it escalates to a repeating alarm.
 
@@ -70,9 +70,11 @@ Contiguous, artifact-gated PPI readings can produce an **RMSSD diagnostic** on P
 
 v3.0 uses a new detector-state schema. On first run it clears the old HR baseline together with incompatible rolling buffers, streaks, VMC EMA, and HRV state, then recalibrates from stable quiet-awake readings. This deliberately avoids carrying forward a baseline that the previous algorithm may have inflated or allowed to follow a doze.
 
-**If NapBuster alarms while you are awake and sitting still**, check **Settings → Last alert** first. `OS sleep` means Pebble's sleep classification triggered it; `HR drop` means the main detector did. For repeated HR-drop alarms, the resting baseline may be too high. Open Settings and press SELECT on **Recalibrate** to discard it and measure it again from quiet readings. The HR detector cannot alert until calibration completes; the OS fallback remains available. Choosing a less sensitive Detection level widens the HR-drop band.
+**If NapBuster alarms while you are awake and sitting still**, check **Settings → Last alert** first. `OS sleep` means Pebble's sleep classification triggered it; `HR drop` means the main detector did; `Snooze` means a snooze you set ended while you still looked asleep. For repeated HR-drop alarms, the resting baseline may be too high. Open Settings and press SELECT on **Recalibrate** to discard it and measure it again from quiet readings. The HR detector cannot alert until calibration completes; the OS fallback remains available. Choosing a less sensitive Detection level widens the HR-drop band.
 
 Dismissal blocks new alerts for ten minutes, including queued messages or worker launches delivered after the button press. The cooldown is checked by both the worker and the foreground app. Snooze and guard settings are also rechecked at delivery. v3.0.5 adds these delivery checks and the OS sleep safeguards without changing Tier 1 thresholds or HR sampling periods.
+
+**When a snooze ends**, NapBuster no longer rings again unconditionally. It asks the same question as the OS sleep fallback: if a fresh reading shows movement, or HR back above the full-drop line, you are evidently up and it quietly returns to guarding; if HR is still dropped, you are woken as you asked. So a "wake me after a ten-minute power nap" snooze keeps working. With no fresh reading it waits up to three minutes for one and then rings, because missing data cannot show you are awake. **Last alert** in Settings reports `Snooze` for these, so a re-ring is no longer mistaken for a new detection.
 
 ---
 
@@ -82,7 +84,7 @@ Dismissal blocks new alerts for ten minutes, including queued messages or worker
 - 🔔 **Two-stage wake** — gentle nudge after two minutes of valid evidence; full alarm at five minutes only with a continuing full HR drop
 - 🛡️ **Fallback detection** — Pebble Health sleep classification remains a safety net
 - 📳 **Repeating vibration alarm** — keeps buzzing until dismissed or snoozed
-- 💤 **Snooze** — 10 or 30 minutes via the Wakeup API; an expiry outside the active schedule does not sound an alarm
+- 💤 **Snooze** — 10 or 30 minutes via the Wakeup API. When it ends, NapBuster checks before ringing again: still asleep and it wakes you, up and about and it goes back to guarding. An expiry outside the active schedule never sounds an alarm
 - 📅 **Per-day schedule** — choose exactly which days to guard, including overnight windows
 - 💪 **Vibration strength** — Gentle / Medium / Strong
 - 🎛️ **Detection sensitivity** — Sensitive / Balanced / Conservative
@@ -286,6 +288,8 @@ NapBuster is a convenience tool, **not a medical or safety device**. Do not rely
 
 | Version | What changed |
 |---|---|
+| **3.0.6** | Snooze no longer re-rings blind. Expiry used to start the full alarm after checking only that guarding was on and in window — no evidence at all — so waking up during a snooze still ended in an alarm. Reported as a ring at HR 71 against a 72 baseline. The worker now decides, reusing the OS sleep fallback's contradiction test: fresh movement or HR above the full-drop line resumes guarding quietly, while a still-dropped HR rings as before, so a power-nap snooze still works. The request is persisted and re-checked on the minute tick, so a dropped message or worker restart cannot lose a wake-up, and on a wakeup launch the prompt waits until the app can hear the answer. With no worker running, it rings as before. **Last alert** now reports `Snooze`; previously it kept the snoozed alarm's source, so a re-ring looked like a fresh HR detection. Detection logic, timings, and thresholds are unchanged. |
+| **3.0.5** | A dismissal blocks new alerts for ten minutes, including queued messages and worker launches delivered after the button press, checked in both the worker and the foreground app; snooze and guard settings are rechecked at delivery. The OS sleep fallback is suppressed when a fresh analysis contradicts it. Adds **Last alert** to Settings. Tier 1 thresholds and HR sampling periods are unchanged. |
 | **3.0.4** | Adds **Recalibrate** and **Version** rows to Settings. Recalibrate clears the learned HR baseline on demand — previously the only way out of a baseline that had drifted above the wearer's resting HR was a release that bumped the detector schema. Version shows the installed build on the watch; the app had not displayed it since 3.0.0, so the phone was the only place to check. CI now fails if the constant and package.json disagree. Detection logic is unchanged. |
 | **3.0.3** | Forces a one-time baseline re-seed. A baseline that ends up above the wearer's settled resting HR cannot correct itself once that resting HR falls below the full-drop line, because a quiet full-drop sample is always positive and calibration refuses positive samples. Reported from the field as a 64 BPM resting HR against a latched 73 BPM baseline, which made sitting still read as a full drop and alarm. Wrist motion cannot separate that from a real nap — the reporter sat motionless through both the nudge and the alarm — so this release resets the baseline rather than guessing, and the limitation is now pinned down by a named test. Detection logic, timings, and thresholds are unchanged. |
 | **3.0.2** | Fixed a false-alarm latch in baseline calibration. Calibration was gated on the soft-drop boundary, which is circular: a baseline a few BPM above the wearer's true quiet-awake HR puts that HR inside the soft band, where it both counts as doze evidence and is refused as the input that would correct it. The baseline could never come down, so every still moment became a candidate and nudged. Reported from the field as a 68 BPM reading against a latched 73 BPM baseline. Calibration is now refused only above the full-drop boundary and on any sample scored positive (which also covers the episode-onset sample). Timings and sensitivity thresholds are unchanged. |

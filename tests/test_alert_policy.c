@@ -132,7 +132,97 @@ static void test_supporting_hr_and_missing_data_keep_fallback(void) {
     EXPECT(!nap_sleep_fallback_contradicted(&result, false, 1240u, 1240u, 1240u));
 }
 
+/* Reported: HR 71 against a 72 baseline, plainly awake, and a snooze re-rang
+ * anyway because expiry never consulted the detector. */
+static void test_snooze_expiry_while_awake_resumes_guard(void) {
+    NapDetector detector;
+    NapDetectorResult result = {0};
+    uint32_t last = 0u;
+    int i;
+
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 72u);
+    for (i = 0; i < 3; ++i) {
+        last = 10000u + (uint32_t)i * 120u;
+        result = analyze(&detector, last, 71, 20u);
+    }
+    EXPECT(!result.hr_full_drop);
+    EXPECT(nap_snooze_check_decide(last, last + 30u, &result, true,
+                                   last, last) == NAP_SNOOZE_CHECK_RESUME);
+}
+
+/* "Wake me after a ten-minute power nap" must keep working: someone still
+ * asleep still has a dropped HR, so the snooze ends in an alarm as before. */
+static void test_snooze_expiry_while_still_asleep_rings(void) {
+    NapDetector detector;
+    NapDetectorResult result = {0};
+    uint32_t last = 0u;
+    int i;
+
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 72u);
+    for (i = 0; i < 3; ++i) {
+        last = 20000u + (uint32_t)i * 120u;
+        result = analyze(&detector, last, 60, 20u);
+    }
+    EXPECT(result.hr_full_drop);
+    EXPECT(nap_snooze_check_decide(last, last + 30u, &result, true,
+                                   last, last) == NAP_SNOOZE_CHECK_RING);
+}
+
+/* Clear movement is enough on its own, even before HR smoothing is ready. */
+static void test_snooze_expiry_with_fresh_movement_resumes_guard(void) {
+    NapDetector detector;
+    NapDetectorResult result;
+
+    nap_detector_init(&detector, NAP_DETECTOR_BALANCED);
+    nap_detector_restore_baseline(&detector, 72u);
+    result = analyze(&detector, 30000u, 60, 900u);
+    EXPECT(result.movement);
+    EXPECT(nap_snooze_check_decide(30000u, 30010u, &result, false,
+                                   30000u, 30000u) ==
+           NAP_SNOOZE_CHECK_RESUME);
+}
+
+/* Missing data cannot prove the wearer awake: wait briefly for a reading,
+ * then honour the snooze they asked for. */
+static void test_snooze_expiry_waits_briefly_for_a_reading(void) {
+    NapDetectorResult none = {0};
+    uint32_t requested = 40000u;
+
+    EXPECT(nap_snooze_check_decide(requested, requested + 60u, &none, false,
+                                   0u, 0u) == NAP_SNOOZE_CHECK_WAIT);
+    EXPECT(nap_snooze_check_decide(requested,
+                                   requested + NAP_SNOOZE_CHECK_WAIT_SECONDS,
+                                   &none, false, 0u, 0u) ==
+           NAP_SNOOZE_CHECK_RING);
+    /* A reading older than the gap limit counts as missing too. */
+    EXPECT(nap_snooze_check_decide(
+               requested, requested + 30u, &none, false,
+               requested - NAP_DETECTOR_MAX_GAP_SECONDS - 1u, 0u) ==
+           NAP_SNOOZE_CHECK_WAIT);
+}
+
+static void test_stale_or_warped_snooze_request_is_dropped(void) {
+    NapDetectorResult none = {0};
+    uint32_t requested = 50000u;
+
+    EXPECT(nap_snooze_check_decide(0u, requested, &none, false, 0u, 0u) ==
+           NAP_SNOOZE_CHECK_DROP);
+    EXPECT(nap_snooze_check_decide(requested, requested - 1u, &none, false,
+                                   0u, 0u) == NAP_SNOOZE_CHECK_DROP);
+    EXPECT(nap_snooze_check_decide(
+               requested, requested + NAP_SNOOZE_CHECK_STALE_SECONDS + 1u,
+               &none, false, 0u, 0u) == NAP_SNOOZE_CHECK_DROP);
+}
+
+
 int main(void) {
+    test_snooze_expiry_while_awake_resumes_guard();
+    test_snooze_expiry_while_still_asleep_rings();
+    test_snooze_expiry_with_fresh_movement_resumes_guard();
+    test_snooze_expiry_waits_briefly_for_a_reading();
+    test_stale_or_warped_snooze_request_is_dropped();
     test_dismiss_between_dispatch_and_delivery();
     test_reported_awake_reading_contradicts_os_sleep();
     test_same_os_sleep_episode_stays_acknowledged();
