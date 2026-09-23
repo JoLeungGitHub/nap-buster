@@ -77,16 +77,41 @@ static void cancel_existing_wakeup(void) {
     }
 }
 
-/** Finish a snooze wakeup without creating an out-of-hours alarm.
+/* Set on a wakeup launch, whose snooze prompt must wait until this app has
+ * subscribed to worker messages and can hear the answer. */
+static bool s_snooze_check_prompt_pending = false;
+
+static void prv_prompt_snooze_check(void) {
+    s_snooze_check_prompt_pending = false;
+    AppWorkerMessage msg = { .data0 = APP_MSG_SNOOZE_EXPIRED };
+    app_worker_send_message(APP_MSG_SNOOZE_EXPIRED, &msg);
+}
+
+/** Finish a snooze without re-ringing blind.
  *
- * A scheduled wakeup can arrive after the guard was disabled, its day was
- * deselected, or the configured window ended.  In those cases snooze is
- * cleared and the worker is reconciled, but the user is not disturbed. */
-static void handle_snooze_expiry(void) {
+ * Outside the schedule (guard disabled, day deselected, window ended) the
+ * snooze simply clears. Inside it, the worker decides with fresh evidence: a
+ * wearer who is still asleep still has a dropped HR and is woken as they
+ * asked, while one who is plainly up returns to guarding. The request is
+ * persisted so a dropped prompt cannot lose it. */
+static void handle_snooze_expiry(bool can_message_now) {
     persist_write_int(PERSIST_KEY_SNOOZE_UNTIL, 0);
     persist_delete(PERSIST_KEY_WAKEUP_ID_SNOOZE);
 
     if (settings_get_enabled() && is_in_no_nap_window()) {
+        if (app_worker_is_running()) {
+            persist_write_int(PERSIST_KEY_SNOOZE_CHECK, (int)time(NULL));
+            if (can_message_now) {
+                prv_prompt_snooze_check();
+            } else {
+                s_snooze_check_prompt_pending = true;
+            }
+            update_home_screen();
+            return;
+        }
+        // No worker to consult: keep the old guarantee that a snooze the
+        // wearer set still wakes them.
+        persist_write_int(PERSIST_KEY_LAST_ALERT_SOURCE, ALERT_SOURCE_SNOOZE);
         start_alarm();
         return;
     }
@@ -98,7 +123,7 @@ static void handle_snooze_expiry(void) {
 
 static void wakeup_handler(WakeupId id, int32_t cookie) {
     if (cookie == WAKEUP_REASON_SNOOZE) {
-        handle_snooze_expiry();
+        handle_snooze_expiry(true);
     }
 }
 
@@ -147,8 +172,10 @@ static void start_alarm(void) {
     text_layer_set_text(s_state_label,  "WAKE UP!");
     text_layer_set_text(s_time_label,   "(>_<)");
     int source = persist_read_int(PERSIST_KEY_LAST_ALERT_SOURCE);
-    text_layer_set_text(s_detail_label, source == ALERT_SOURCE_OS_SLEEP
-        ? "Watch reported sleep" : "Possible doze");
+    text_layer_set_text(s_detail_label,
+        source == ALERT_SOURCE_OS_SLEEP ? "Watch reported sleep"
+        : source == ALERT_SOURCE_SNOOZE ? "Snooze over"
+        : "Possible doze");
     text_layer_set_text(s_days_label,   "");
     text_layer_set_text(s_hint_label,   "");  // side labels take over
 
@@ -684,7 +711,7 @@ static void app_init(void) {
         int32_t  cookie;
         if (wakeup_get_launch_event(&wid, &cookie) &&
             cookie == WAKEUP_REASON_SNOOZE) {
-            handle_snooze_expiry();
+            handle_snooze_expiry(false);
         }
     } else if (initial_reason == APP_LAUNCH_WORKER) {
         // Snapshotting the persisted launch kind before subscribing prevents
@@ -700,6 +727,9 @@ static void app_init(void) {
 
     // The UI and launch intent are now ready, so direct messages are safe.
     app_worker_message_subscribe(worker_message_handler);
+    // A wakeup launch deferred its snooze prompt until the worker's answer
+    // could be heard; send it now.
+    if (s_snooze_check_prompt_pending) prv_prompt_snooze_check();
 
     // Ensure the background worker is running only after subscribing. This
     // closes the small normal-launch window in which a fresh detector action

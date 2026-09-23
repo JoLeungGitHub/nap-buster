@@ -39,14 +39,16 @@
 #define PERSIST_KEY_WORKER_STATUS    30  // uint8 bitmask: worker/sensor readiness
 #define PERSIST_KEY_OS_SLEEP_HANDLED 31 // bool: this OS sleep episode was acknowledged
 #define PERSIST_KEY_LAST_ALERT_SOURCE 32 // int: latest dispatched alert source
+#define PERSIST_KEY_SNOOZE_CHECK      33 // time_t: snooze ended, worker decides whether to re-ring
 
 #define ALERT_SOURCE_HR             1
 #define ALERT_SOURCE_OS_SLEEP       2
 #define ALERT_SOURCE_NUDGE          3
+#define ALERT_SOURCE_SNOOZE         4
 
 /* Shown in Settings so the installed build is identifiable on the watch.
  * CI asserts this matches package.json; bump both together. */
-#define NAPBUSTER_VERSION            "3.0.5"
+#define NAPBUSTER_VERSION            "3.0.6"
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 #define DEFAULT_ENABLED              1
@@ -64,6 +66,7 @@
 #define APP_MSG_DISMISS              12
 #define APP_MSG_SETTINGS_CHANGED     13
 #define APP_MSG_RECALIBRATE          14  // user asked to re-seed the HR baseline
+#define APP_MSG_SNOOZE_EXPIRED       15  // snooze ended: worker decides whether to re-ring
 
 // ─── Wakeup Reason Codes ──────────────────────────────────────────────────────
 #define WAKEUP_REASON_SNOOZE         42

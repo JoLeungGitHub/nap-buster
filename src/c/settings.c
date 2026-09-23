@@ -133,7 +133,8 @@ static void prv_format_value(int row, char *buf, size_t len) {
             int source = persist_read_int(PERSIST_KEY_LAST_ALERT_SOURCE);
             snprintf(buf, len, "%s", source == ALERT_SOURCE_OS_SLEEP
                 ? "OS sleep" : source == ALERT_SOURCE_HR ? "HR drop"
-                : source == ALERT_SOURCE_NUDGE ? "Nudge" : "None");
+                : source == ALERT_SOURCE_NUDGE ? "Nudge"
+                : source == ALERT_SOURCE_SNOOZE ? "Snooze" : "None");
             break;
         }
         default:
